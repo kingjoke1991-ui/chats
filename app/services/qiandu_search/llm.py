@@ -10,6 +10,13 @@ from app.core.config import settings
 from app.providers.openai_compat import OpenAICompatProvider
 from app.repos.model_node_repo import ModelNodeRepo
 from app.schemas.chat import ChatCompletionRequest, ChatMessageInput
+from app.services.qiandu_search.dimensions import (
+    DIMENSION_KEYWORDS as _DIMENSION_KEYWORDS,
+    DOMAIN_ALLOWLIST as QIANDU_DOMAIN_ALLOWLIST,
+    INTENT_CHOICES as QIANDU_INTENT_CHOICES,
+    INTEL_DIMENSIONS,
+    canonical_dimension,
+)
 from app.services.qiandu_search.models import (
     QianduEvidenceChunk,
     QianduIntelExtraction,
@@ -17,162 +24,11 @@ from app.services.qiandu_search.models import (
     QianduSearchTask,
 )
 
-
-# Intent / task-type vocabulary used throughout the pipeline.
-# 8 个综合查询维度 + general 兜底。
-QIANDU_INTENT_CHOICES: set[str] = {
-    "general",
-    "social_id",
-    "wechat",
-    "legal_entity",  # alias of business
-    "person",
-    "company",       # alias of business
-    "business",      # 工商 / 企查
-    "judicial",      # 裁判文书 / 执行 / 失信
-    "education",     # 学历 / 院校 / 学信
-    "profession",    # 职业 / 任职 / LinkedIn / 脉脉 / boss
-    "social",        # 微博 / 小红书 / 抖音 / 知乎 / B 站
-    "news",          # 新闻 / 舆情
-}
-
-
-# Domain allowlists per dimension. Used both by heuristic task generation and
-# by the scoring layer to boost on-topic sources.
-QIANDU_DOMAIN_ALLOWLIST: dict[str, list[str]] = {
-    "business": [
-        "qcc.com",
-        "aiqicha.baidu.com",
-        "tianyancha.com",
-        "qixin.com",
-        "qyjia.com",
-        "qianzhan.com",
-    ],
-    "judicial": [
-        "wenshu.court.gov.cn",
-        "zxgk.court.gov.cn",
-        "court.gov.cn",
-        "zgcpws.com",
-        "judicourt.com",
-        "12309.gov.cn",
-        "shixin.court.gov.cn",
-    ],
-    "education": [
-        "xuexin.com",
-        "chsi.com.cn",
-        "xlcx.chsi.com.cn",
-        "edu.cn",
-        "moe.gov.cn",
-        "cnki.net",
-        "wanfangdata.com.cn",
-        "hanspub.org",
-    ],
-    "profession": [
-        "linkedin.com",
-        "maimai.cn",
-        "zhipin.com",
-        "liepin.com",
-        "zhaopin.com",
-        "51job.com",
-        "lagou.com",
-    ],
-    "social": [
-        "weibo.com",
-        "xiaohongshu.com",
-        "douyin.com",
-        "bilibili.com",
-        "zhihu.com",
-        "douban.com",
-        "jianshu.com",
-        "csdn.net",
-    ],
-    "wechat": ["mp.weixin.qq.com"],
-    "news": [
-        "people.com.cn",
-        "xinhuanet.com",
-        "sina.com.cn",
-        "sohu.com",
-        "163.com",
-        "thepaper.cn",
-        "qq.com",
-        "ifeng.com",
-        "thecover.cn",
-    ],
-}
-
-
-# Keywords that hint at each dimension in free-form Chinese input.
-_DIMENSION_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "business": (
-        "法人",
-        "股东",
-        "注册资本",
-        "统一社会信用代码",
-        "公司",
-        "企业",
-        "工商",
-        "企查",
-        "企查查",
-        "天眼查",
-        "爱企查",
-    ),
-    "judicial": (
-        "裁判",
-        "文书",
-        "判决",
-        "判决书",
-        "法院",
-        "执行",
-        "失信",
-        "被执行人",
-        "诉讼",
-        "立案",
-        "涉诉",
-        "老赖",
-    ),
-    "education": (
-        "学历",
-        "学籍",
-        "毕业",
-        "院校",
-        "本科",
-        "硕士",
-        "博士",
-        "大学",
-        "学校",
-        "学信",
-        "学位",
-        "教育背景",
-    ),
-    "profession": (
-        "任职",
-        "职业",
-        "职位",
-        "工作",
-        "履历",
-        "简历",
-        "从业",
-        "linkedin",
-        "脉脉",
-        "boss",
-        "招聘",
-    ),
-    "social": (
-        "微博",
-        "小红书",
-        "抖音",
-        "快手",
-        "b站",
-        "bilibili",
-        "知乎",
-        "豆瓣",
-        "账号",
-        "uid",
-        "id",
-        "@",
-    ),
-    "wechat": ("公众号", "微信", "公号", "wechat", "mp.weixin"),
-    "news": ("新闻", "舆情", "报道", "媒体", "新闻稿"),
-}
+__all__ = [
+    "QianduSearchLLMOrchestrator",
+    "QIANDU_DOMAIN_ALLOWLIST",
+    "QIANDU_INTENT_CHOICES",
+]
 
 
 class QianduSearchLLMOrchestrator:
@@ -831,35 +687,19 @@ class QianduSearchLLMOrchestrator:
         extraction: QianduIntelExtraction,
         search_results: list[QianduEvidenceChunk],
     ) -> str:
+        from app.services.qiandu_search.dimensions import DIMENSION_LABELS
+
         buckets: dict[str, list[tuple[int, QianduEvidenceChunk]]] = {
-            "business": [],
-            "judicial": [],
-            "education": [],
-            "profession": [],
-            "social": [],
-            "wechat": [],
-            "news": [],
-            "other": [],
+            dim: [] for dim in INTEL_DIMENSIONS
         }
-        label_map = {
-            "business": "工商 / 企业信息",
-            "judicial": "司法记录（裁判文书 / 执行 / 失信）",
-            "education": "教育背景",
-            "profession": "职业信息",
-            "social": "社交信息",
-            "wechat": "微信公众号 / 文章",
-            "news": "新闻与舆情",
-            "other": "其他线索",
-        }
+        buckets["other"] = []
+        label_map = dict(DIMENSION_LABELS)
         for index, chunk in enumerate(search_results, start=1):
-            task_type = str(chunk.metadata.get("task_type") or "").lower()
-            if task_type in {"legal_entity", "company"}:
-                task_type = "business"
-            if task_type in {"social_id"}:
-                task_type = "social"
-            if task_type in {"person", "general", ""}:
-                task_type = "other"
-            buckets.setdefault(task_type, buckets["other"]).append((index, chunk))
+            raw = str(chunk.metadata.get("task_type") or "").lower()
+            dim = canonical_dimension(raw)
+            if dim == "general" or dim not in buckets:
+                dim = "other"
+            buckets[dim].append((index, chunk))
 
         summary = (extraction.summary or extraction.raw_input.strip())[:140]
         lines: list[str] = [
@@ -868,7 +708,7 @@ class QianduSearchLLMOrchestrator:
             "",
         ]
 
-        for key in ["business", "judicial", "education", "profession", "social", "wechat", "news", "other"]:
+        for key in list(INTEL_DIMENSIONS) + ["other"]:
             items = buckets.get(key) or []
             lines.append(f"## {label_map[key]}")
             if not items:

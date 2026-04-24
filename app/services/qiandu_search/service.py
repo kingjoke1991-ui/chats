@@ -10,10 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import AppException
-from app.services.qiandu_search.llm import (
-    QIANDU_DOMAIN_ALLOWLIST,
-    QianduSearchLLMOrchestrator,
+from app.services.qiandu_search.dimensions import (
+    DOMAIN_ALLOWLIST as QIANDU_DOMAIN_ALLOWLIST,
+    INTEL_DIMENSIONS as _INTEL_DIMENSIONS,
+    INTENT_TO_DIMENSION as _TASK_TYPE_ALIASES,
+    canonical_dimension,
 )
+from app.services.qiandu_search.llm import QianduSearchLLMOrchestrator
 from app.services.qiandu_search.models import (
     QianduEvidenceChunk,
     QianduExtractedDocument,
@@ -35,49 +38,6 @@ from app.services.qiandu_search.providers import (
 QIANDU_SEARCH_COMMAND = "qiandu_search"
 
 logger = logging.getLogger(__name__)
-
-
-# Dimensions we actively report on in the综合查询 output.
-_INTEL_DIMENSIONS: tuple[str, ...] = (
-    "business",
-    "judicial",
-    "education",
-    "profession",
-    "social",
-    "wechat",
-    "news",
-)
-
-# Aliases — normalise LLM-provided task types into the canonical set above.
-_TASK_TYPE_ALIASES: dict[str, str] = {
-    "legal_entity": "business",
-    "company": "business",
-    "enterprise": "business",
-    "corp": "business",
-    "court": "judicial",
-    "legal": "judicial",
-    "wenshu": "judicial",
-    "judgement": "judicial",
-    "lawsuit": "judicial",
-    "edu": "education",
-    "school": "education",
-    "university": "education",
-    "job": "profession",
-    "career": "profession",
-    "employment": "profession",
-    "linkedin": "profession",
-    "social_id": "social",
-    "handle": "social",
-    "weibo": "social",
-    "xiaohongshu": "social",
-    "douyin": "social",
-    "douban": "social",
-    "zhihu": "social",
-    "person": "social",
-    "wechat_public": "wechat",
-    "press": "news",
-    "media": "news",
-}
 
 
 # Low-quality page markers — if a fetched document is dominated by these
@@ -490,8 +450,7 @@ class QianduSearchService:
 
     def _normalize_task_types(self, tasks: list[QianduSearchTask]) -> list[QianduSearchTask]:
         for task in tasks:
-            canonical = _TASK_TYPE_ALIASES.get(task.task_type, task.task_type)
-            task.task_type = canonical if canonical in _INTEL_DIMENSIONS or canonical == "general" else "general"
+            task.task_type = canonical_dimension(task.task_type)
         return tasks
 
     @staticmethod
