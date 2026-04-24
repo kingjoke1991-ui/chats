@@ -6,6 +6,7 @@ from app.core.db import SessionLocal
 from app.core.redis import get_redis
 from app.services.auth_service import AuthService
 from app.services.model_node_service import ModelNodeService
+from app.services.qiandu_search.providers import Crawl4AIMarkdownExtractor
 from app.services.telegram_userbot_manager import get_telegram_userbot_manager
 
 
@@ -20,4 +21,5 @@ async def app_startup_check() -> None:
 
 async def app_shutdown() -> None:
     await get_telegram_userbot_manager().stop()
+    await Crawl4AIMarkdownExtractor.aclose_all()
     await get_redis().aclose()

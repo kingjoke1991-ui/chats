@@ -266,13 +266,14 @@ class QianduSearchService:
             degradations.append(f"synthesize_fallback:{type(exc).__name__}")
             answer = self._fallback_answer(query_text, evidence_chunks)
 
-        content = self._compose_output(answer, evidence_chunks)
+        content = await self._finalize_simple_content(answer, evidence_chunks, degradations)
         return QianduSearchCommandResult(
             command=QIANDU_SEARCH_COMMAND,
             content=content,
             metadata={
                 "query_text": query_text,
                 "pipeline": "simple",
+                "degradations": list(degradations),
                 "plan": {
                     "queries": plan.queries,
                     "intent": plan.intent,
@@ -842,6 +843,43 @@ class QianduSearchService:
         if marker_hits >= 2:
             return True
         return marker_hits >= 1 and len(text) < 200
+
+    async def _finalize_simple_content(
+        self,
+        answer: str,
+        evidence_chunks: list[QianduEvidenceChunk],
+        degradations: list[str],
+    ) -> str:
+        """Apply the same inline-vs-download overflow handling the intel
+        pipeline uses, so a long LLM answer with many sources no longer
+        blows past the chat UI's reasonable message length."""
+
+        combined = self._compose_output(answer, evidence_chunks)
+        inline_limit = max(1000, int(getattr(settings, "qiandu_report_inline_max_chars", 6000)))
+        if len(combined) <= inline_limit:
+            return combined
+
+        try:
+            download = await self.download_service.create_download(
+                text=combined,
+                file_name="qiandu_simple_report.md",
+                mime_type="text/markdown",
+            )
+        except Exception as exc:
+            logger.warning("qiandu download service unavailable for simple report: %s", exc)
+            degradations.append(f"download_unavailable:{type(exc).__name__}")
+            return combined[:inline_limit].rstrip() + "\n\n（结果过长且下载服务不可用，已截断。）"
+
+        preview_limit = max(800, min(inline_limit // 2, 2400))
+        preview = (answer or "").strip()[:preview_limit].rstrip()
+        sources_block = "\n".join(
+            line for line in combined.splitlines() if line.startswith("来源：") or line
+        )
+        return (
+            f"{preview}\n\n"
+            f"（结果较长，已生成完整下载链接：{download['url']}）\n\n"
+            f"{sources_block[:inline_limit // 2]}"
+        ).strip()
 
     @staticmethod
     def _compose_output(answer: str, evidence_chunks: list[QianduEvidenceChunk]) -> str:

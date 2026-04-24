@@ -805,12 +805,46 @@ class QianduSearchLLMOrchestrator:
         return [str(v).strip() for v in value if v]
 
     async def _select_node(self, *, requested_model: str | None, allowed_models: list[str]):
-        del requested_model
-        del allowed_models
+        """Pick a model node, honouring the caller's preferences.
+
+        Order of preference:
+
+        1. ``requested_model`` if the subscription allows it and a routable
+           node exposes that model.
+        2. The qiandu-preferred node code from settings, as long as either
+           no allowlist was given (admin / background call) or it's in the
+           allowlist.
+        3. The best routable node that satisfies the allowlist, so we never
+           silently route a user's request through a model their plan does
+           not include.
+        4. ``None`` — callers drop down to the heuristic fallback.
+        """
+
+        allowed = [m for m in (allowed_models or []) if m]
+
+        def _node_matches_allowed(candidate) -> bool:
+            if not allowed:
+                return True
+            aliases = set(candidate.capability_json.get("model_aliases", []) or [])
+            aliases.add(candidate.code)
+            aliases.add(candidate.model_name)
+            return bool(aliases.intersection(allowed))
+
+        if requested_model and (not allowed or requested_model in allowed):
+            node = await self.model_nodes.get_routable_for_model(requested_model)
+            if node and node.enabled:
+                return node
+
         preferred_code = settings.resolved_qiandu_llm_node_code
-        node = await self.model_nodes.get_by_code(preferred_code)
-        if node and node.enabled:
-            return node
+        if preferred_code:
+            node = await self.model_nodes.get_by_code(preferred_code)
+            if node and node.enabled and _node_matches_allowed(node):
+                return node
+
+        if allowed:
+            best = await self.model_nodes.get_best_available_for_models(allowed)
+            if best and best.enabled:
+                return best
         return None
 
     async def _run_prompt(
