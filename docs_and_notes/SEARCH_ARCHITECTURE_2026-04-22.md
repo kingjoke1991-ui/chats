@@ -13,9 +13,14 @@
 - `#搜索 xxx`
   - 通用 Web Search
   - 优先官方站点、文档、新闻、更新日志
-- `#千度 xxx`
+- `#千度 xxx`（也接受 `#千 xxx` / `#千问 xxx`，等价别名，便于移动端手残输入）
   - 中文语境增强检索
   - 优先处理社交账号、公众号、企业信息、多源拼接
+  - 信号驱动路由：含手机号 / 身份证 / 邮箱 / `@handle` / 公司名 / 维度关键词（法人/裁判/学历/公众号…）时触发 intel pipeline；仅含一个普通中文名则走 simple pipeline
+  - 可通过 `QIANDU_INTEL_SIGNAL_THRESHOLD`（默认 2）调整触发阈值
+  - 全流水线由 `QIANDU_TOTAL_BUDGET_SECONDS`（默认 240s）硬时限保护，超时自动降级到 simple pipeline
+  - provider 并发由 `QIANDU_PROVIDER_CONCURRENCY`、`QIANDU_LOCAL_TOOL_CONCURRENCY` 限流；Crawl4AI 浏览器进程级复用，由 `QIANDU_CRAWL4AI_CONCURRENCY` 限制同时运行的页面数
+  - provider / extractor / synth / fuse 中的失败会以 `degradations` 字段汇总到返回 metadata，便于用户看到哪条路被降级了
 
 ## 模块边界
 `#千度` 采用独立包：

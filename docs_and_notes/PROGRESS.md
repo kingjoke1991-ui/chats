@@ -20,7 +20,7 @@
 - `获取最新短信列表`
 - `#查询 xxx`
 - `#搜索 xxx`
-- `#千度 xxx`
+- `#千度 xxx`（兼容别名：`#千 xxx` / `#千问 xxx`）
 
 ## 2026-04-22 新增进展
 - 新增独立的 `qiandu_search` 模块，入口为 `#千度`
@@ -127,3 +127,18 @@
 - **核心分支合并**：完成 `origin/devin/1777001380-qiandu-comprehensive-osint` 的本地合并与推送，同步了最新的“#千度”多阶段 OSINT 流水线。
 - **生产环境完整部署**：针对大规模重构，采用了 `tar` 打包同步方案（排除敏感文件），并在服务器端完成 Docker 镜像重建与应用热重启。
 - **代码安全加固**：优化了 `.gitignore` 配置，自动排除 `SECRETS` 类文档及本地密钥文件（k.key 等），确保敏感信息不流入 GitHub 仓库。
+
+## 2026-04-24 `#千度` 模块优化（本次）
+针对审查报告中 `qiandu_search` 模块的问题，完成了 10 项内部优化，保留 `qiandu_search` / `web_search` 独立封装（未合并）：
+1. 维度 / 别名 / 领域白名单 / 关键词统一到 `app/services/qiandu_search/dimensions.py`，`service.py` 和 `llm.py` 只引用，不再各维护一份。
+2. `match_command` 支持 `#千 xxx` / `#千度 xxx` / `#千问 xxx` 三种等价写法，兼容历史文档与移动端。
+3. `should_trigger_intel_pipeline` 从「任意 ≥2 字」改为信号驱动打分（手机号 +2 / 身份证 +2 / 邮箱 +1 / `@handle` +1 / 公司名 +1 / 维度关键词 +1 / 多名 +1 / 长输入 +1），阈值可经 `QIANDU_INTEL_SIGNAL_THRESHOLD` 调节，默认 2。路由结果通过 `metadata.pipeline_router` 暴露给调用方。
+4. intel pipeline 外包一层 `asyncio.wait_for(..., QIANDU_TOTAL_BUDGET_SECONDS)` 硬预算，超时自动降级到 simple pipeline 并写入 `degradations`。
+5. provider 全局 `asyncio.Semaphore`：远端 API (`QIANDU_PROVIDER_CONCURRENCY`) 与本地工具 (`QIANDU_LOCAL_TOOL_CONCURRENCY`) 分开限流；intel 任务自身也有 `QIANDU_INTEL_TASK_CONCURRENCY` 的并发上限。
+6. `Crawl4AIMarkdownExtractor` 改为进程级共享浏览器池 + `QIANDU_CRAWL4AI_CONCURRENCY` 限流，`app_shutdown` 里统一回收；通过 `QIANDU_CRAWL4AI_SHARED_BROWSER=false` 可回退到原来的「每次重建」行为。
+7. `_score_result` 的 `must_include` 由硬过滤 (`-100`) 改为软权重 (`+6 / -4`)，避免 provider snippet 截断时把真命中挡在外面。
+8. `LocalCommandSearchProvider` 从 `create_subprocess_shell` 改成 `create_subprocess_exec + shlex.split`，消除命令注入风险，并在可执行文件缺失时给出明确错误码。
+9. `service.py` / `providers.py` / `local_tools.py` 里零散的 `except Exception: pass` 换成 `logger.warning/exception` + `degradations.append(...)`，provider / extractor / synth / fuse 的失败会在返回 metadata 里以结构化字符串汇总。
+10. `QianduSearchLLMOrchestrator._select_node` 真实执行 `requested_model` → qiandu 首选节点 → `allowed_models` 的兜底匹配，不再丢弃入参。
+11. simple pipeline 复用 intel pipeline 的溢出处理：长结果自动走 `TelegramDownloadService` 生成下载链接，下载失败则写入 `degradations` 并截断。
+12. 测试补齐：`match_command` 多别名、`classify_trigger` 评分、`must_include` 软打分回归、provider 崩溃时的 `degradations` 暴露、`dimensions` 模块单一真相。当前 `pytest -q` 59 passed。

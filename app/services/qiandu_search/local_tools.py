@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -12,6 +13,8 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 SNOOP_ROOT = Path("/opt/snoop")
 SNOOP_CSV_DIR = SNOOP_ROOT / "results" / "nicknames" / "csv"
@@ -94,8 +97,8 @@ def run_wechat_public_search(query: str) -> dict[str, Any]:
             normalized = _normalize_search_results(raw_results, provider="wechat_crawler")
             if normalized:
                 return {"results": normalized}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("SearXNG WeChat lookup failed, falling back to Tavily: %s", exc)
 
     tavily_key = settings.qiandu_tavily_api_key or settings.web_search_tavily_api_key
     if tavily_key:

@@ -10,6 +10,13 @@ from app.core.config import settings
 from app.providers.openai_compat import OpenAICompatProvider
 from app.repos.model_node_repo import ModelNodeRepo
 from app.schemas.chat import ChatCompletionRequest, ChatMessageInput
+from app.services.qiandu_search.dimensions import (
+    DIMENSION_KEYWORDS as _DIMENSION_KEYWORDS,
+    DOMAIN_ALLOWLIST as QIANDU_DOMAIN_ALLOWLIST,
+    INTENT_CHOICES as QIANDU_INTENT_CHOICES,
+    INTEL_DIMENSIONS,
+    canonical_dimension,
+)
 from app.services.qiandu_search.models import (
     QianduEvidenceChunk,
     QianduIntelExtraction,
@@ -17,162 +24,11 @@ from app.services.qiandu_search.models import (
     QianduSearchTask,
 )
 
-
-# Intent / task-type vocabulary used throughout the pipeline.
-# 8 个综合查询维度 + general 兜底。
-QIANDU_INTENT_CHOICES: set[str] = {
-    "general",
-    "social_id",
-    "wechat",
-    "legal_entity",  # alias of business
-    "person",
-    "company",       # alias of business
-    "business",      # 工商 / 企查
-    "judicial",      # 裁判文书 / 执行 / 失信
-    "education",     # 学历 / 院校 / 学信
-    "profession",    # 职业 / 任职 / LinkedIn / 脉脉 / boss
-    "social",        # 微博 / 小红书 / 抖音 / 知乎 / B 站
-    "news",          # 新闻 / 舆情
-}
-
-
-# Domain allowlists per dimension. Used both by heuristic task generation and
-# by the scoring layer to boost on-topic sources.
-QIANDU_DOMAIN_ALLOWLIST: dict[str, list[str]] = {
-    "business": [
-        "qcc.com",
-        "aiqicha.baidu.com",
-        "tianyancha.com",
-        "qixin.com",
-        "qyjia.com",
-        "qianzhan.com",
-    ],
-    "judicial": [
-        "wenshu.court.gov.cn",
-        "zxgk.court.gov.cn",
-        "court.gov.cn",
-        "zgcpws.com",
-        "judicourt.com",
-        "12309.gov.cn",
-        "shixin.court.gov.cn",
-    ],
-    "education": [
-        "xuexin.com",
-        "chsi.com.cn",
-        "xlcx.chsi.com.cn",
-        "edu.cn",
-        "moe.gov.cn",
-        "cnki.net",
-        "wanfangdata.com.cn",
-        "hanspub.org",
-    ],
-    "profession": [
-        "linkedin.com",
-        "maimai.cn",
-        "zhipin.com",
-        "liepin.com",
-        "zhaopin.com",
-        "51job.com",
-        "lagou.com",
-    ],
-    "social": [
-        "weibo.com",
-        "xiaohongshu.com",
-        "douyin.com",
-        "bilibili.com",
-        "zhihu.com",
-        "douban.com",
-        "jianshu.com",
-        "csdn.net",
-    ],
-    "wechat": ["mp.weixin.qq.com"],
-    "news": [
-        "people.com.cn",
-        "xinhuanet.com",
-        "sina.com.cn",
-        "sohu.com",
-        "163.com",
-        "thepaper.cn",
-        "qq.com",
-        "ifeng.com",
-        "thecover.cn",
-    ],
-}
-
-
-# Keywords that hint at each dimension in free-form Chinese input.
-_DIMENSION_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "business": (
-        "法人",
-        "股东",
-        "注册资本",
-        "统一社会信用代码",
-        "公司",
-        "企业",
-        "工商",
-        "企查",
-        "企查查",
-        "天眼查",
-        "爱企查",
-    ),
-    "judicial": (
-        "裁判",
-        "文书",
-        "判决",
-        "判决书",
-        "法院",
-        "执行",
-        "失信",
-        "被执行人",
-        "诉讼",
-        "立案",
-        "涉诉",
-        "老赖",
-    ),
-    "education": (
-        "学历",
-        "学籍",
-        "毕业",
-        "院校",
-        "本科",
-        "硕士",
-        "博士",
-        "大学",
-        "学校",
-        "学信",
-        "学位",
-        "教育背景",
-    ),
-    "profession": (
-        "任职",
-        "职业",
-        "职位",
-        "工作",
-        "履历",
-        "简历",
-        "从业",
-        "linkedin",
-        "脉脉",
-        "boss",
-        "招聘",
-    ),
-    "social": (
-        "微博",
-        "小红书",
-        "抖音",
-        "快手",
-        "b站",
-        "bilibili",
-        "知乎",
-        "豆瓣",
-        "账号",
-        "uid",
-        "id",
-        "@",
-    ),
-    "wechat": ("公众号", "微信", "公号", "wechat", "mp.weixin"),
-    "news": ("新闻", "舆情", "报道", "媒体", "新闻稿"),
-}
+__all__ = [
+    "QianduSearchLLMOrchestrator",
+    "QIANDU_DOMAIN_ALLOWLIST",
+    "QIANDU_INTENT_CHOICES",
+]
 
 
 class QianduSearchLLMOrchestrator:
@@ -329,26 +185,86 @@ class QianduSearchLLMOrchestrator:
             return self._fallback_answer(query_text, evidence_chunks)
 
     def should_trigger_intel_pipeline(self, text: str) -> bool:
-        """Decide whether to use the comprehensive multi-dimension intel pipeline.
+        """Decide whether to fire the multi-dimension intel pipeline.
 
-        This is intentionally much more permissive than `detect_structured_input`.
-        The old detector only fired when the input looked like a pasted profile
-        record, which meant the vast majority of `#千度` queries degraded to a
-        single-intent plan. For proper 综合查询 we want the pipeline to fire
-        whenever the input plausibly identifies a real-world entity.
+        Thin wrapper over :meth:`classify_trigger` — see that method's
+        docstring for the full signal list and scoring rules. The intel
+        pipeline spends 3 LLM calls and up to ``qiandu_max_search_tasks``
+        parallel provider hits, so we only fire it when the input carries
+        enough signal that a multi-dimensional OSINT sweep is worth the
+        cost. Otherwise we fall through to the cheaper simple pipeline.
+        """
+
+        return self.classify_trigger(text)["pipeline"] == "intel_fusion"
+
+    def classify_trigger(self, text: str) -> dict[str, object]:
+        """Expose the routing decision and its score for observability.
+
+        Signals (each worth 1 point unless noted; threshold configurable
+        via ``QIANDU_INTEL_SIGNAL_THRESHOLD``, default 2):
+
+        * phone number (+2) / id number (+2) / email / ``@handle``
+        * an organization mention (公司 / 集团 / 学校 / 医院 / …)
+        * a dimension keyword hit (工商 / 裁判 / 学历 / 公众号 / …)
+        * 2+ distinct Chinese-name-shaped tokens
+        * multi-line structured input (>= 3 newlines) or >= 60 chars
         """
 
         if not text:
-            return False
+            return {"pipeline": "simple", "score": 0, "threshold": 0, "reason": "empty"}
         stripped = text.strip()
         if len(stripped) < 2:
-            return False
-
-        # Looks like a bare URL — no point exploding into multi-dimension tasks.
+            return {"pipeline": "simple", "score": 0, "threshold": 0, "reason": "too_short"}
         if re.match(r"^https?://\S+$", stripped):
-            return False
+            return {"pipeline": "simple", "score": 0, "threshold": 0, "reason": "bare_url"}
 
-        return True
+        threshold = max(1, int(getattr(settings, "qiandu_intel_signal_threshold", 2)))
+        reasons: list[str] = []
+        score = 0
+        if re.search(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)", stripped):
+            score += 2
+            reasons.append("phone")
+        if re.search(
+            r"\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b",
+            stripped,
+        ):
+            score += 2
+            reasons.append("id")
+        if re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", stripped):
+            score += 1
+            reasons.append("email")
+        if re.search(r"@[A-Za-z0-9_\-.]{3,}", stripped):
+            score += 1
+            reasons.append("handle")
+        if re.search(
+            r"[\u4e00-\u9fff]{2,}(?:公司|集团|厂|有限责任公司|股份有限公司|"
+            r"事务所|工作室|学校|大学|学院|医院|研究院|协会|基金会)",
+            stripped,
+        ):
+            score += 1
+            reasons.append("organization")
+        lowered = stripped.lower()
+        if any(
+            kw.lower() in lowered
+            for keywords in _DIMENSION_KEYWORDS.values()
+            for kw in keywords
+        ):
+            score += 1
+            reasons.append("dimension_keyword")
+        chinese_tokens = re.findall(r"[\u4e00-\u9fff]{2,4}", stripped)
+        if len(set(chinese_tokens)) >= 2:
+            score += 1
+            reasons.append("multi_name")
+        if stripped.count("\n") >= 2 or len(stripped) >= 60:
+            score += 1
+            reasons.append("structured_dump")
+
+        return {
+            "pipeline": "intel_fusion" if score >= threshold else "simple",
+            "score": score,
+            "threshold": threshold,
+            "reason": ",".join(reasons) or "no_signal",
+        }
 
     @staticmethod
     def detect_structured_input(text: str) -> bool:
@@ -831,35 +747,19 @@ class QianduSearchLLMOrchestrator:
         extraction: QianduIntelExtraction,
         search_results: list[QianduEvidenceChunk],
     ) -> str:
+        from app.services.qiandu_search.dimensions import DIMENSION_LABELS
+
         buckets: dict[str, list[tuple[int, QianduEvidenceChunk]]] = {
-            "business": [],
-            "judicial": [],
-            "education": [],
-            "profession": [],
-            "social": [],
-            "wechat": [],
-            "news": [],
-            "other": [],
+            dim: [] for dim in INTEL_DIMENSIONS
         }
-        label_map = {
-            "business": "工商 / 企业信息",
-            "judicial": "司法记录（裁判文书 / 执行 / 失信）",
-            "education": "教育背景",
-            "profession": "职业信息",
-            "social": "社交信息",
-            "wechat": "微信公众号 / 文章",
-            "news": "新闻与舆情",
-            "other": "其他线索",
-        }
+        buckets["other"] = []
+        label_map = dict(DIMENSION_LABELS)
         for index, chunk in enumerate(search_results, start=1):
-            task_type = str(chunk.metadata.get("task_type") or "").lower()
-            if task_type in {"legal_entity", "company"}:
-                task_type = "business"
-            if task_type in {"social_id"}:
-                task_type = "social"
-            if task_type in {"person", "general", ""}:
-                task_type = "other"
-            buckets.setdefault(task_type, buckets["other"]).append((index, chunk))
+            raw = str(chunk.metadata.get("task_type") or "").lower()
+            dim = canonical_dimension(raw)
+            if dim == "general" or dim not in buckets:
+                dim = "other"
+            buckets[dim].append((index, chunk))
 
         summary = (extraction.summary or extraction.raw_input.strip())[:140]
         lines: list[str] = [
@@ -868,7 +768,7 @@ class QianduSearchLLMOrchestrator:
             "",
         ]
 
-        for key in ["business", "judicial", "education", "profession", "social", "wechat", "news", "other"]:
+        for key in list(INTEL_DIMENSIONS) + ["other"]:
             items = buckets.get(key) or []
             lines.append(f"## {label_map[key]}")
             if not items:
@@ -905,12 +805,46 @@ class QianduSearchLLMOrchestrator:
         return [str(v).strip() for v in value if v]
 
     async def _select_node(self, *, requested_model: str | None, allowed_models: list[str]):
-        del requested_model
-        del allowed_models
+        """Pick a model node, honouring the caller's preferences.
+
+        Order of preference:
+
+        1. ``requested_model`` if the subscription allows it and a routable
+           node exposes that model.
+        2. The qiandu-preferred node code from settings, as long as either
+           no allowlist was given (admin / background call) or it's in the
+           allowlist.
+        3. The best routable node that satisfies the allowlist, so we never
+           silently route a user's request through a model their plan does
+           not include.
+        4. ``None`` — callers drop down to the heuristic fallback.
+        """
+
+        allowed = [m for m in (allowed_models or []) if m]
+
+        def _node_matches_allowed(candidate) -> bool:
+            if not allowed:
+                return True
+            aliases = set(candidate.capability_json.get("model_aliases", []) or [])
+            aliases.add(candidate.code)
+            aliases.add(candidate.model_name)
+            return bool(aliases.intersection(allowed))
+
+        if requested_model and (not allowed or requested_model in allowed):
+            node = await self.model_nodes.get_routable_for_model(requested_model)
+            if node and node.enabled:
+                return node
+
         preferred_code = settings.resolved_qiandu_llm_node_code
-        node = await self.model_nodes.get_by_code(preferred_code)
-        if node and node.enabled:
-            return node
+        if preferred_code:
+            node = await self.model_nodes.get_by_code(preferred_code)
+            if node and node.enabled and _node_matches_allowed(node):
+                return node
+
+        if allowed:
+            best = await self.model_nodes.get_best_available_for_models(allowed)
+            if best and best.enabled:
+                return best
         return None
 
     async def _run_prompt(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import re
 import shlex
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ import httpx
 from app.core.config import settings
 from app.core.exceptions import AppException
 from app.services.qiandu_search.models import QianduExtractedDocument, QianduSearchPlan, QianduSearchResult
+
+logger = logging.getLogger(__name__)
 
 
 class QianduSearchProvider(Protocol):
@@ -272,12 +275,21 @@ class LocalCommandSearchProvider:
         if not self.command_template:
             return []
 
-        rendered = self._render_command(plan.query)
-        process = await asyncio.create_subprocess_shell(
-            rendered,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        argv = self._resolve_argv(plan.query)
+        if not argv:
+            return []
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise AppException(
+                502,
+                "QIANDU_LOCAL_TOOL_MISSING",
+                f"{self.name} command binary not found: {exc.filename}",
+            ) from exc
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 process.communicate(),
@@ -299,12 +311,26 @@ class LocalCommandSearchProvider:
 
         return self._parse_output(plan.query, stdout, stderr)
 
-    def _render_command(self, query: str) -> str:
-        escaped_query = shlex.quote(query)
-        template = self.command_template or ""
+    def _resolve_argv(self, query: str) -> list[str]:
+        """Tokenise ``command_template`` into an argv list without invoking a
+        shell. Using ``create_subprocess_exec`` instead of
+        ``create_subprocess_shell`` sidesteps command injection and spares
+        the cost of spawning a shell per search.
+
+        The ``{query}`` placeholder (if present) is substituted with the
+        raw query. Otherwise the query is appended as a single additional
+        argv entry — either way, the user's query is never passed through
+        ``/bin/sh``.
+        """
+
+        template = (self.command_template or "").strip()
+        if not template:
+            return []
         if "{query}" in template:
-            return template.format(query=escaped_query)
-        return f"{template} {escaped_query}".strip()
+            return [token.replace("{query}", query) for token in shlex.split(template)]
+        argv = shlex.split(template)
+        argv.append(query)
+        return argv
 
     def _parse_output(self, query: str, stdout: str, stderr: str) -> list[QianduSearchResult]:
         del stderr
@@ -349,9 +375,23 @@ class LocalCommandSearchProvider:
         ]
 
 
-@dataclass(slots=True)
 class Crawl4AIMarkdownExtractor:
+    """Extracts markdown via Crawl4AI using a process-wide browser pool.
+
+    Spawning a fresh Chromium per request costs 0.5–2s and a few MB of RAM
+    even on a warm cache, and the intel pipeline may fan out to many URLs
+    at once. We keep a single shared ``AsyncWebCrawler`` per event loop +
+    browser-config key, and gate concurrent ``arun`` calls with an
+    ``asyncio.Semaphore`` sized by ``QIANDU_CRAWL4AI_CONCURRENCY``.
+    """
+
     name: str = "crawl4ai"
+
+    # Registry keyed by (loop_id, browser_config_signature) so tests that
+    # spin up multiple event loops don't share a crawler across loops.
+    _registry: dict[tuple[int, str], Any] = {}
+    _locks: dict[tuple[int, str], asyncio.Lock] = {}
+    _semaphores: dict[tuple[int, str], asyncio.Semaphore] = {}
 
     def is_enabled(self) -> bool:
         if not settings.qiandu_crawl4ai_enabled:
@@ -381,34 +421,114 @@ class Crawl4AIMarkdownExtractor:
         run_config = CrawlerRunConfig()
         documents: list[QianduExtractedDocument] = []
 
+        use_shared = bool(getattr(settings, "qiandu_crawl4ai_shared_browser", True))
         try:
-            async with AsyncWebCrawler(config=browser_config) as crawler:
-                for item in results:
-                    if item.url.startswith("local://"):
-                        continue
-                    try:
-                        result = await asyncio.wait_for(
-                            crawler.arun(url=item.url, config=run_config),
-                            timeout=settings.qiandu_extract_timeout_seconds,
-                        )
-                    except Exception:
-                        continue
-
-                    content = self._extract_markdown(result)
-                    if not content:
-                        continue
-                    documents.append(
-                        QianduExtractedDocument(
-                            title=item.title,
-                            url=item.url,
-                            content=content[: settings.qiandu_max_document_chars],
-                            provider=self.name,
-                            metadata={"source_provider": item.provider},
-                        )
+            if use_shared:
+                crawler = await self._get_or_start_crawler(AsyncWebCrawler, browser_config)
+                semaphore = self._get_semaphore(browser_config)
+                documents = await self._run_with_crawler(
+                    crawler, run_config, results, semaphore=semaphore
+                )
+            else:
+                async with AsyncWebCrawler(config=browser_config) as crawler:
+                    documents = await self._run_with_crawler(
+                        crawler,
+                        run_config,
+                        results,
+                        semaphore=asyncio.Semaphore(
+                            max(1, int(getattr(settings, "qiandu_crawl4ai_concurrency", 2)))
+                        ),
                     )
-        except Exception:
+        except Exception as exc:
+            logger.warning("crawl4ai extractor failed: %s", exc)
             return []
         return documents
+
+    async def _run_with_crawler(
+        self,
+        crawler: Any,
+        run_config: Any,
+        results: list[QianduSearchResult],
+        *,
+        semaphore: asyncio.Semaphore,
+    ) -> list[QianduExtractedDocument]:
+        async def _fetch_one(item: QianduSearchResult) -> QianduExtractedDocument | None:
+            if item.url.startswith("local://"):
+                return None
+            async with semaphore:
+                try:
+                    result = await asyncio.wait_for(
+                        crawler.arun(url=item.url, config=run_config),
+                        timeout=settings.qiandu_extract_timeout_seconds,
+                    )
+                except TimeoutError:
+                    logger.info("crawl4ai timeout on %s", item.url)
+                    return None
+                except Exception as exc:
+                    logger.info("crawl4ai failed on %s: %s", item.url, exc)
+                    return None
+            content = self._extract_markdown(result)
+            if not content:
+                return None
+            return QianduExtractedDocument(
+                title=item.title,
+                url=item.url,
+                content=content[: settings.qiandu_max_document_chars],
+                provider=self.name,
+                metadata={"source_provider": item.provider},
+            )
+
+        fetched = await asyncio.gather(*[_fetch_one(item) for item in results])
+        return [doc for doc in fetched if doc is not None]
+
+    async def _get_or_start_crawler(self, crawler_cls: Any, browser_config: Any) -> Any:
+        key = self._config_key(browser_config)
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            existing = self._registry.get(key)
+            if existing is not None:
+                return existing
+            crawler = crawler_cls(config=browser_config)
+            await crawler.__aenter__()
+            self._registry[key] = crawler
+            return crawler
+
+    def _get_semaphore(self, browser_config: Any) -> asyncio.Semaphore:
+        key = self._config_key(browser_config)
+        if key not in self._semaphores:
+            self._semaphores[key] = asyncio.Semaphore(
+                max(1, int(getattr(settings, "qiandu_crawl4ai_concurrency", 2)))
+            )
+        return self._semaphores[key]
+
+    @staticmethod
+    def _config_key(browser_config: Any) -> tuple[int, str]:
+        try:
+            loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            loop_id = 0
+        signature_fields = (
+            getattr(browser_config, "headless", None),
+            getattr(browser_config, "user_data_dir", None),
+            getattr(browser_config, "text_mode", None),
+            getattr(browser_config, "enable_stealth", None),
+        )
+        return (loop_id, repr(signature_fields))
+
+    @classmethod
+    async def aclose_all(cls) -> None:
+        """Tear down every shared crawler. Called at process shutdown so
+        we don't leak Chromium processes in long-running deployments."""
+
+        for key, crawler in list(cls._registry.items()):
+            try:
+                await crawler.__aexit__(None, None, None)
+            except Exception as exc:
+                logger.warning("failed to close crawl4ai crawler %s: %s", key, exc)
+            finally:
+                cls._registry.pop(key, None)
+                cls._locks.pop(key, None)
+                cls._semaphores.pop(key, None)
 
     @staticmethod
     def _parse_json_value(raw: str | None, *, expected_type):

@@ -26,6 +26,31 @@ def test_match_command_extracts_query_text() -> None:
     }
 
 
+def test_match_command_accepts_short_and_qianwen_aliases() -> None:
+    service = QianduSearchService.__new__(QianduSearchService)
+
+    # Historical docs (and some chat clients) use `#千 ...` and `#千问 ...`
+    # interchangeably with `#千度 ...`. Treat them as the same command so
+    # users don't have to remember which spelling the backend wants.
+    assert QianduSearchService.match_command(service, "#千 张三 法人") == {
+        "command": QIANDU_SEARCH_COMMAND,
+        "query_text": "张三 法人",
+    }
+    assert QianduSearchService.match_command(service, "#千问 张三 法人") == {
+        "command": QIANDU_SEARCH_COMMAND,
+        "query_text": "张三 法人",
+    }
+    # Full-width space separator (common when pasting from mobile clients).
+    assert QianduSearchService.match_command(service, "#千\u3000张三 法人") == {
+        "command": QIANDU_SEARCH_COMMAND,
+        "query_text": "张三 法人",
+    }
+    # Sanity: unrelated prefix still rejected.
+    assert QianduSearchService.match_command(service, "#搜 张三 法人") is None
+    # Bare command with no query → rejected.
+    assert QianduSearchService.match_command(service, "#千度 ") is None
+
+
 @pytest.mark.asyncio
 async def test_execute_prefers_provider_mix_and_sources() -> None:
     class FakeLLM:
@@ -248,13 +273,35 @@ def test_heuristic_generate_tasks_covers_all_dimensions() -> None:
         assert required in dimensions, f"missing dimension {required}"
 
 
-def test_should_trigger_intel_pipeline_permissive() -> None:
+def test_should_trigger_intel_pipeline_signal_driven() -> None:
     orchestrator = QianduSearchLLMOrchestrator.__new__(QianduSearchLLMOrchestrator)
-    assert orchestrator.should_trigger_intel_pipeline("张三") is True
+    # A bare common Chinese name has no OSINT signal — intel pipeline is
+    # far too expensive to fire for this. Simple pipeline handles it.
+    assert orchestrator.should_trigger_intel_pipeline("张三") is False
+    # Name + dimension keyword → clear OSINT target.
     assert orchestrator.should_trigger_intel_pipeline("张三 深圳 法人") is True
+    # Phone alone is enough (2-point signal).
+    assert orchestrator.should_trigger_intel_pipeline("13800001234") is True
+    # Id number alone is enough.
+    assert orchestrator.should_trigger_intel_pipeline("110101199001011234") is True
+    # Handle + dimension keyword (social).
+    assert orchestrator.should_trigger_intel_pipeline("@alice_li 小红书") is True
     # Bare URLs should not trigger the expensive multi-dimension pipeline.
     assert orchestrator.should_trigger_intel_pipeline("https://example.com/page") is False
     assert orchestrator.should_trigger_intel_pipeline("") is False
+
+
+def test_classify_trigger_returns_scoring_metadata() -> None:
+    orchestrator = QianduSearchLLMOrchestrator.__new__(QianduSearchLLMOrchestrator)
+    verdict = orchestrator.classify_trigger("张三 深圳 法人")
+    assert verdict["pipeline"] == "intel_fusion"
+    assert isinstance(verdict["score"], int) and verdict["score"] >= verdict["threshold"]
+    assert "organization" not in verdict["reason"]  # 深圳 has no company suffix
+    assert "dimension_keyword" in verdict["reason"]
+
+    cheap = orchestrator.classify_trigger("张三")
+    assert cheap["pipeline"] == "simple"
+    assert cheap["score"] < cheap["threshold"]
 
 
 @pytest.mark.asyncio
@@ -438,3 +485,149 @@ async def test_must_include_hard_filter_only_fires_for_strong_identifiers() -> N
     assert result.metadata["pipeline"] == "intel_fusion"
     # Result survives even though the snippet does not literally contain "张三"
     assert "qcc.com" in result.content
+
+
+# --- must_include soft-scoring regression ---------------------------------
+
+
+def test_score_result_must_include_is_soft() -> None:
+    """The `must_include` weight used to be a hard `-100` filter that dropped
+    high-quality results whose snippet was truncated. It is now a soft
+    penalty, so a trusted-domain hit survives even when the identifier is
+    not present in the (often truncated) snippet."""
+
+    service = QianduSearchService.__new__(QianduSearchService)
+
+    matched_result = QianduSearchResult(
+        title="企业信息",
+        url="https://qcc.com/firm/abc",
+        snippet="法人 张三 股东 注册资本",
+        score=0.9,
+        provider="tavily",
+    )
+    missing_result = QianduSearchResult(
+        title="企业信息",
+        url="https://qcc.com/firm/xyz",
+        snippet="法人 股东 注册资本",  # no literal "13800001234"
+        score=0.9,
+        provider="tavily",
+    )
+
+    matched_score = QianduSearchService._score_result(
+        service, "张三", "business", matched_result, must_include=["张三"]
+    )
+    missing_score = QianduSearchService._score_result(
+        service, "张三", "business", missing_result, must_include=["13800001234"]
+    )
+
+    # Matching `must_include` scores clearly above the miss case,
+    # but the miss is NOT annihilated (no -100 floor anymore) — it stays
+    # well above the `-50` drop threshold used by `_rank_and_filter_results`.
+    assert matched_score > missing_score
+    assert missing_score > -50.0
+
+
+# --- degradations metadata ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_surfaces_degradations_when_providers_fail() -> None:
+    """Silent exception handling used to hide real failures from users.
+    The service now appends a structured ``degradations`` entry to the
+    response metadata whenever a provider or extractor falls back."""
+
+    class FakeLLM:
+        async def build_plan(self, *, query_text, allowed_models, requested_model):
+            del allowed_models, requested_model
+            return QianduSearchPlan(query=query_text, queries=[query_text], intent="general")
+
+        async def synthesize_answer(
+            self, *, query_text, plan, evidence_chunks, allowed_models, requested_model
+        ):
+            del query_text, plan, evidence_chunks, allowed_models, requested_model
+            return "summary"
+
+    class BrokenProvider:
+        name = "tavily"
+
+        def is_enabled(self) -> bool:
+            return True
+
+        async def search(self, plan):
+            del plan
+            raise RuntimeError("upstream down")
+
+    class GoodProvider:
+        name = "exa"
+
+        def is_enabled(self) -> bool:
+            return True
+
+        async def search(self, plan):
+            return [
+                QianduSearchResult(
+                    title="hit",
+                    url="https://example.com/a",
+                    snippet=f"{plan.query} evidence",
+                    score=1.0,
+                    provider=self.name,
+                )
+            ]
+
+    class FakeExtractor:
+        name = "ok"
+
+        def is_enabled(self) -> bool:
+            return True
+
+        async def extract(self, results):
+            return [
+                QianduExtractedDocument(
+                    title=r.title,
+                    url=r.url,
+                    content=r.snippet,
+                    provider=self.name,
+                )
+                for r in results
+            ]
+
+    service = QianduSearchService(
+        session=SimpleNamespace(),
+        llm=FakeLLM(),
+        providers=[BrokenProvider(), GoodProvider()],
+        extractors=[FakeExtractor()],
+    )
+
+    result = await service.execute(
+        query_text="example query", allowed_models=[], requested_model=None
+    )
+
+    assert result.metadata["pipeline"] == "simple"
+    degradations = result.metadata.get("degradations") or []
+    assert any("provider_crashed:tavily" in entry for entry in degradations), degradations
+    router = result.metadata.get("pipeline_router")
+    assert isinstance(router, dict) and router["pipeline"] == "simple"
+
+
+# --- dimensions single source of truth ------------------------------------
+
+
+def test_dimensions_module_is_single_source_of_truth() -> None:
+    from app.services.qiandu_search import dimensions
+    from app.services.qiandu_search.llm import (
+        QIANDU_DOMAIN_ALLOWLIST,
+        QIANDU_INTENT_CHOICES,
+    )
+
+    # llm.py must re-export the same constants the service layer uses.
+    assert QIANDU_DOMAIN_ALLOWLIST is dimensions.DOMAIN_ALLOWLIST
+    assert QIANDU_INTENT_CHOICES is dimensions.INTENT_CHOICES
+    # Every canonical dimension has a label and a keyword bucket.
+    for dim in dimensions.INTEL_DIMENSIONS:
+        assert dim in dimensions.DIMENSION_LABELS
+        assert dim in dimensions.DIMENSION_KEYWORDS
+    # The alias map normalises every LLM-known intent to a canonical
+    # dimension or to "general".
+    for alias in dimensions.INTENT_CHOICES:
+        canonical = dimensions.canonical_dimension(alias)
+        assert canonical == "general" or canonical in dimensions.INTEL_DIMENSIONS
