@@ -23,6 +23,7 @@ dependencies = [
     "python-multipart>=0.0.12",
     "curl_cffi>=0.7.0",
     "playwright-stealth>=1.0.6",
+    "ddddocr>=1.4.11",
     "redis>=5.2.0",
     "SQLAlchemy>=2.0.36",
     "structlog>=24.4.0",
