@@ -79,9 +79,17 @@ class QianduSearchService:
         self.fallback_extractor = HttpFallbackExtractor()
         self.download_service = TelegramDownloadService()
 
+    # Accepts `#千 ...`, `#千度 ...`, and `#千问 ...` — historically the
+    # README and some chat clients have used different spellings for the
+    # same综合查询 command, so we normalise them all to one handler.
+    _COMMAND_PATTERN = re.compile(
+        r"^#千(?:度|问)?[\s\u3000](.+)$",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
     def match_command(self, content: str) -> dict[str, str] | None:
         stripped = content.strip()
-        matched = re.match(r"^#千度\s+(.+)$", stripped, flags=re.DOTALL | re.IGNORECASE)
+        matched = self._COMMAND_PATTERN.match(stripped)
         if not matched:
             return None
 
@@ -105,48 +113,116 @@ class QianduSearchService:
                 "千度搜索尚未配置。请至少启用 Tavily、Exa、SearXNG、Snoop 或 WeChat-Crawler 之一。",
             )
 
-        if self._should_use_intel_pipeline(query_text):
+        router = self._classify_pipeline(query_text)
+        degradations: list[str] = []
+
+        if router["pipeline"] == "intel_fusion":
+            budget = max(30, int(getattr(settings, "qiandu_total_budget_seconds", 240)))
             try:
-                return await self._execute_intel_pipeline(
-                    query_text=query_text,
-                    active_providers=active_providers,
-                    allowed_models=allowed_models,
-                    requested_model=requested_model,
+                result = await asyncio.wait_for(
+                    self._execute_intel_pipeline(
+                        query_text=query_text,
+                        active_providers=active_providers,
+                        allowed_models=allowed_models,
+                        requested_model=requested_model,
+                        degradations=degradations,
+                    ),
+                    timeout=budget,
                 )
+                self._attach_router_metadata(result, router, degradations)
+                return result
             except AppException:
                 raise
+            except TimeoutError:
+                logger.warning(
+                    "qiandu intel pipeline exceeded %ss budget; falling back to simple plan",
+                    budget,
+                )
+                degradations.append(f"intel_timeout:{budget}s")
             except Exception as exc:
                 logger.exception("qiandu intel pipeline crashed, falling back to simple plan: %s", exc)
-                # fall through to simple pipeline as a last resort.
+                degradations.append(f"intel_crash:{type(exc).__name__}")
 
-        return await self._execute_simple_pipeline(
+        result = await self._execute_simple_pipeline(
             query_text=query_text,
             active_providers=active_providers,
             allowed_models=allowed_models,
             requested_model=requested_model,
+            degradations=degradations,
         )
+        self._attach_router_metadata(result, router, degradations)
+        return result
+
+    @staticmethod
+    def _attach_router_metadata(
+        result: QianduSearchCommandResult,
+        router: dict[str, object],
+        degradations: list[str],
+    ) -> None:
+        result.metadata["pipeline_router"] = dict(router)
+        if degradations:
+            existing = result.metadata.get("degradations")
+            if isinstance(existing, list):
+                existing.extend(degradations)
+            else:
+                result.metadata["degradations"] = list(degradations)
 
     # ------------------------------------------------------------------
     # Pipeline selection
     # ------------------------------------------------------------------
 
     def _should_use_intel_pipeline(self, query_text: str) -> bool:
+        return self._classify_pipeline(query_text)["pipeline"] == "intel_fusion"
+
+    def _classify_pipeline(self, query_text: str) -> dict[str, object]:
+        """Return routing metadata `{pipeline, score, threshold, reason}`.
+
+        The routing decision is made by the LLM orchestrator (which holds
+        the signal-scoring logic) where possible, but we gracefully fall
+        back to a legacy detector or a hard "simple" default so tests and
+        custom orchestrators without the new API still work.
+        """
+
         if not hasattr(self.llm, "extract_entities") or not hasattr(self.llm, "generate_search_tasks"):
-            return False
+            return {"pipeline": "simple", "score": 0, "threshold": 0, "reason": "intel_api_missing"}
+
+        classifier = getattr(self.llm, "classify_trigger", None)
+        if callable(classifier):
+            try:
+                verdict = classifier(query_text)
+            except Exception:
+                logger.exception("qiandu classify_trigger crashed; defaulting to simple pipeline")
+                return {"pipeline": "simple", "score": 0, "threshold": 0, "reason": "classifier_error"}
+            if isinstance(verdict, dict) and verdict.get("pipeline") in {"simple", "intel_fusion"}:
+                return verdict
+
         detector = getattr(self.llm, "should_trigger_intel_pipeline", None)
         if callable(detector):
             try:
-                return bool(detector(query_text))
+                fired = bool(detector(query_text))
             except Exception:
-                return False
-        # Legacy LLMs: only fall into intel pipeline when the old strict detector agrees.
+                logger.exception("qiandu should_trigger_intel_pipeline crashed; defaulting to simple")
+                fired = False
+            return {
+                "pipeline": "intel_fusion" if fired else "simple",
+                "score": 1 if fired else 0,
+                "threshold": 1,
+                "reason": "legacy_detector",
+            }
+
         legacy = getattr(self.llm, "detect_structured_input", None)
         if callable(legacy):
             try:
-                return bool(legacy(query_text))
+                fired = bool(legacy(query_text))
             except Exception:
-                return False
-        return False
+                fired = False
+            return {
+                "pipeline": "intel_fusion" if fired else "simple",
+                "score": 1 if fired else 0,
+                "threshold": 1,
+                "reason": "detect_structured_input",
+            }
+        return {"pipeline": "simple", "score": 0, "threshold": 0, "reason": "no_detector"}
 
     # ------------------------------------------------------------------
     # Simple (single-intent) pipeline — retained for backwards compatibility.
@@ -159,7 +235,9 @@ class QianduSearchService:
         active_providers: list[QianduSearchProvider],
         allowed_models: list[str],
         requested_model: str | None,
+        degradations: list[str] | None = None,
     ) -> QianduSearchCommandResult:
+        degradations = degradations if degradations is not None else []
         plan = await self.llm.build_plan(
             query_text=query_text,
             allowed_models=allowed_models,
@@ -167,11 +245,13 @@ class QianduSearchService:
         )
         plan = self._refine_plan(query_text, plan)
 
-        search_results, used_providers = await self._search(active_providers, plan)
+        search_results, used_providers = await self._search(
+            active_providers, plan, degradations=degradations
+        )
         if not search_results:
             raise AppException(404, "QIANDU_NO_RESULTS", "没有检索到相关结果。")
 
-        documents = await self._extract(search_results)
+        documents = await self._extract(search_results, degradations=degradations)
         evidence_chunks = self._select_evidence(query_text, plan, search_results, documents)
         try:
             answer = await self.llm.synthesize_answer(
@@ -181,7 +261,9 @@ class QianduSearchService:
                 allowed_models=allowed_models,
                 requested_model=requested_model,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("qiandu synthesize_answer failed; using fallback summary: %s", exc)
+            degradations.append(f"synthesize_fallback:{type(exc).__name__}")
             answer = self._fallback_answer(query_text, evidence_chunks)
 
         content = self._compose_output(answer, evidence_chunks)
@@ -235,7 +317,9 @@ class QianduSearchService:
         active_providers: list[QianduSearchProvider],
         allowed_models: list[str],
         requested_model: str | None,
+        degradations: list[str] | None = None,
     ) -> QianduSearchCommandResult:
+        degradations = degradations if degradations is not None else []
         extraction = await self.llm.extract_entities(
             raw_input=query_text,
             allowed_models=allowed_models,
@@ -250,11 +334,13 @@ class QianduSearchService:
         if not tasks:
             # Nothing structured to work with — degrade to simple pipeline so the
             # user at least sees some result for the raw query.
+            degradations.append("no_tasks_generated")
             return await self._execute_simple_pipeline(
                 query_text=query_text,
                 active_providers=active_providers,
                 allowed_models=allowed_models,
                 requested_model=requested_model,
+                degradations=degradations,
             )
 
         tasks = self._normalize_task_types(tasks)
@@ -270,37 +356,44 @@ class QianduSearchService:
         task_errors: list[str] = []
         task_stats: list[dict[str, object]] = []
 
+        task_concurrency = max(1, int(getattr(settings, "qiandu_intel_task_concurrency", 3)))
+        task_semaphore = asyncio.Semaphore(task_concurrency)
+
         async def _run_task(task: QianduSearchTask) -> None:
-            plan = self._plan_from_task(task, extraction)
-            try:
-                results, provider_names = await self._search(
-                    active_providers,
-                    plan,
-                    must_include=must_include_terms or None,
-                )
-                used_providers.update(provider_names)
-                documents = await self._extract(results)
-                chunks = self._select_evidence(task.query, plan, results, documents)
-                # tag each chunk with its task dimension so the fuse step can
-                # structure the output correctly.
-                for chunk in chunks:
-                    chunk.metadata.setdefault("task_id", task.task_id)
-                    chunk.metadata.setdefault("task_type", task.task_type)
-                all_evidence.extend(chunks)
-                task_stats.append(
-                    {
-                        "task_id": task.task_id,
-                        "task_type": task.task_type,
-                        "query": task.query,
-                        "results": len(results),
-                        "chunks": len(chunks),
-                    }
-                )
-            except AppException as exc:
-                task_errors.append(f"{task.task_id}:{exc.error_code}:{exc.message}")
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.exception("qiandu intel task %s failed: %s", task.task_id, exc)
-                task_errors.append(f"{task.task_id}:UNEXPECTED:{exc}")
+            async with task_semaphore:
+                plan = self._plan_from_task(task, extraction)
+                try:
+                    results, provider_names = await self._search(
+                        active_providers,
+                        plan,
+                        must_include=must_include_terms or None,
+                        degradations=degradations,
+                    )
+                    used_providers.update(provider_names)
+                    documents = await self._extract(results, degradations=degradations)
+                    chunks = self._select_evidence(task.query, plan, results, documents)
+                    # tag each chunk with its task dimension so the fuse step can
+                    # structure the output correctly.
+                    for chunk in chunks:
+                        chunk.metadata.setdefault("task_id", task.task_id)
+                        chunk.metadata.setdefault("task_type", task.task_type)
+                    all_evidence.extend(chunks)
+                    task_stats.append(
+                        {
+                            "task_id": task.task_id,
+                            "task_type": task.task_type,
+                            "query": task.query,
+                            "results": len(results),
+                            "chunks": len(chunks),
+                        }
+                    )
+                except AppException as exc:
+                    task_errors.append(f"{task.task_id}:{exc.error_code}:{exc.message}")
+                    degradations.append(f"task_app_error:{task.task_id}:{exc.error_code}")
+                except Exception as exc:
+                    logger.exception("qiandu intel task %s failed: %s", task.task_id, exc)
+                    task_errors.append(f"{task.task_id}:UNEXPECTED:{exc}")
+                    degradations.append(f"task_crashed:{task.task_id}:{type(exc).__name__}")
 
         await asyncio.gather(*[_run_task(task) for task in tasks])
 
@@ -328,12 +421,17 @@ class QianduSearchService:
                 },
             )
 
-        report_text = await self.llm.fuse_intel_report(
-            extraction=extraction,
-            search_results=evidence,
-            allowed_models=allowed_models,
-            requested_model=requested_model,
-        )
+        try:
+            report_text = await self.llm.fuse_intel_report(
+                extraction=extraction,
+                search_results=evidence,
+                allowed_models=allowed_models,
+                requested_model=requested_model,
+            )
+        except Exception as exc:
+            logger.warning("qiandu fuse_intel_report failed; using heuristic report: %s", exc)
+            degradations.append(f"fuse_fallback:{type(exc).__name__}")
+            report_text = ""
 
         content = await self._finalize_intel_content(report_text, evidence, query_text)
 
@@ -348,6 +446,7 @@ class QianduSearchService:
                 "errors": task_errors,
                 "providers": sorted(used_providers),
                 "extraction": self._extraction_to_dict(extraction),
+                "degradations": list(degradations),
                 "evidence": [
                     {
                         "title": chunk.title,
@@ -525,7 +624,9 @@ class QianduSearchService:
         providers: list[QianduSearchProvider],
         plan: QianduSearchPlan,
         must_include: list[str] | None = None,
+        degradations: list[str] | None = None,
     ) -> tuple[list[QianduSearchResult], list[str]]:
+        degradations = degradations if degradations is not None else []
         ordered = self._sort_providers(providers, plan.preferred_providers)
         merged_results: list[QianduSearchResult] = []
         used_providers: list[str] = []
@@ -533,20 +634,33 @@ class QianduSearchService:
 
         for provider in ordered:
             provider_results: list[QianduSearchResult] = []
+            semaphore = self._semaphore_for_provider(provider.name)
             for query in plan.queries[: settings.qiandu_max_queries]:
                 try:
-                    provider_results.extend(await provider.search(plan.with_query(query)))
+                    async with semaphore:
+                        hits = await provider.search(plan.with_query(query))
+                    provider_results.extend(hits)
                 except AppException as exc:
                     errors.append(exc)
+                    degradations.append(f"provider_app_error:{provider.name}:{exc.error_code}")
                     provider_results = []
                     break
                 except Exception as exc:
+                    logger.warning(
+                        "qiandu provider %s failed on query=%r: %s",
+                        provider.name,
+                        query,
+                        exc,
+                    )
                     errors.append(
                         AppException(
                             502,
                             "QIANDU_PROVIDER_FAILED",
                             f"{provider.name} provider failed unexpectedly: {exc}",
                         )
+                    )
+                    degradations.append(
+                        f"provider_crashed:{provider.name}:{type(exc).__name__}"
                     )
                     provider_results = []
                     break
@@ -561,7 +675,12 @@ class QianduSearchService:
             raise errors[-1]
         return [], used_providers
 
-    async def _extract(self, search_results: list[QianduSearchResult]) -> list[QianduExtractedDocument]:
+    async def _extract(
+        self,
+        search_results: list[QianduSearchResult],
+        degradations: list[str] | None = None,
+    ) -> list[QianduExtractedDocument]:
+        degradations = degradations if degradations is not None else []
         selected = search_results[: settings.qiandu_max_extract_urls]
         documents: list[QianduExtractedDocument] = []
         remaining = selected
@@ -571,7 +690,15 @@ class QianduSearchService:
                 continue
             try:
                 extracted = await extractor.extract(remaining)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "qiandu extractor %s failed: %s",
+                    getattr(extractor, "name", type(extractor).__name__),
+                    exc,
+                )
+                degradations.append(
+                    f"extractor_crashed:{getattr(extractor, 'name', 'unknown')}:{type(exc).__name__}"
+                )
                 continue
             if extracted:
                 documents.extend(extracted)
@@ -579,9 +706,36 @@ class QianduSearchService:
                 remaining = [item for item in remaining if item.url not in covered_urls]
 
         if remaining:
-            documents.extend(await self.fallback_extractor.extract(remaining))
+            try:
+                documents.extend(await self.fallback_extractor.extract(remaining))
+            except Exception as exc:
+                logger.warning("qiandu fallback extractor failed: %s", exc)
+                degradations.append(f"fallback_extractor_crashed:{type(exc).__name__}")
 
         return self._dedupe_documents(documents)
+
+    # Per-provider semaphores are shared across all tasks of a single
+    # ``QianduSearchService`` instance so the intel pipeline cannot stampede
+    # upstream APIs when many tasks run concurrently.
+    @classmethod
+    def _semaphore_for_provider(cls, provider_name: str) -> asyncio.Semaphore:
+        registry = cls._provider_semaphores()
+        if provider_name not in registry:
+            registry[provider_name] = asyncio.Semaphore(cls._default_provider_limit(provider_name))
+        return registry[provider_name]
+
+    @classmethod
+    def _provider_semaphores(cls) -> dict[str, asyncio.Semaphore]:
+        if not hasattr(cls, "_provider_sem_registry"):
+            cls._provider_sem_registry = {}  # type: ignore[attr-defined]
+        return cls._provider_sem_registry  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _default_provider_limit(provider_name: str) -> int:
+        local_tool_names = {"snoop", "wechat_crawler"}
+        if provider_name in local_tool_names:
+            return max(1, int(getattr(settings, "qiandu_local_tool_concurrency", 1)))
+        return max(1, int(getattr(settings, "qiandu_provider_concurrency", 2)))
 
     def _select_evidence(
         self,
@@ -770,16 +924,26 @@ class QianduSearchService:
         domain = self._domain_of(result.url)
         score = self._score_text(query_text, intent, result.snippet, result.title, base=max(result.score, 0.2))
 
-        # Strong identifier filtering — only applied when caller passed concrete
-        # identifiers such as a phone number, id number, email or @handle. Bare
-        # personal names are deliberately NOT treated as strong identifiers
-        # because they are far too noisy on Chinese web pages.
+        # Strong identifier weighting — only applied when caller passed
+        # concrete identifiers such as a phone number, id number, email or
+        # ``@handle``. Bare personal names are deliberately NOT treated as
+        # strong identifiers because they are far too noisy on Chinese web
+        # pages.
+        #
+        # This used to be a hard filter returning ``-100`` and dropping the
+        # result, but provider snippets are often truncated so a genuine
+        # match on the underlying page was being silently filtered out. We
+        # now apply a soft weight: a big bonus on match, a moderate penalty
+        # on miss. Together with the trusted-domain and provider bonuses
+        # below this lets high-quality sources (.gov / 企查查 / 微信公众号)
+        # survive a miss while crowding out obvious spam.
         if must_include:
             haystack = f"{result.title}\n{result.snippet}\n{result.url}"
             matched = any(term and term in haystack for term in must_include)
-            if not matched:
-                return -100.0
-            score += 6.0
+            if matched:
+                score += 6.0
+            else:
+                score -= 4.0
 
         score += self._domain_bonus_for_intent(domain, intent)
 

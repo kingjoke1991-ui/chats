@@ -185,26 +185,86 @@ class QianduSearchLLMOrchestrator:
             return self._fallback_answer(query_text, evidence_chunks)
 
     def should_trigger_intel_pipeline(self, text: str) -> bool:
-        """Decide whether to use the comprehensive multi-dimension intel pipeline.
+        """Decide whether to fire the multi-dimension intel pipeline.
 
-        This is intentionally much more permissive than `detect_structured_input`.
-        The old detector only fired when the input looked like a pasted profile
-        record, which meant the vast majority of `#千度` queries degraded to a
-        single-intent plan. For proper 综合查询 we want the pipeline to fire
-        whenever the input plausibly identifies a real-world entity.
+        Thin wrapper over :meth:`classify_trigger` — see that method's
+        docstring for the full signal list and scoring rules. The intel
+        pipeline spends 3 LLM calls and up to ``qiandu_max_search_tasks``
+        parallel provider hits, so we only fire it when the input carries
+        enough signal that a multi-dimensional OSINT sweep is worth the
+        cost. Otherwise we fall through to the cheaper simple pipeline.
+        """
+
+        return self.classify_trigger(text)["pipeline"] == "intel_fusion"
+
+    def classify_trigger(self, text: str) -> dict[str, object]:
+        """Expose the routing decision and its score for observability.
+
+        Signals (each worth 1 point unless noted; threshold configurable
+        via ``QIANDU_INTEL_SIGNAL_THRESHOLD``, default 2):
+
+        * phone number (+2) / id number (+2) / email / ``@handle``
+        * an organization mention (公司 / 集团 / 学校 / 医院 / …)
+        * a dimension keyword hit (工商 / 裁判 / 学历 / 公众号 / …)
+        * 2+ distinct Chinese-name-shaped tokens
+        * multi-line structured input (>= 3 newlines) or >= 60 chars
         """
 
         if not text:
-            return False
+            return {"pipeline": "simple", "score": 0, "threshold": 0, "reason": "empty"}
         stripped = text.strip()
         if len(stripped) < 2:
-            return False
-
-        # Looks like a bare URL — no point exploding into multi-dimension tasks.
+            return {"pipeline": "simple", "score": 0, "threshold": 0, "reason": "too_short"}
         if re.match(r"^https?://\S+$", stripped):
-            return False
+            return {"pipeline": "simple", "score": 0, "threshold": 0, "reason": "bare_url"}
 
-        return True
+        threshold = max(1, int(getattr(settings, "qiandu_intel_signal_threshold", 2)))
+        reasons: list[str] = []
+        score = 0
+        if re.search(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)", stripped):
+            score += 2
+            reasons.append("phone")
+        if re.search(
+            r"\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b",
+            stripped,
+        ):
+            score += 2
+            reasons.append("id")
+        if re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", stripped):
+            score += 1
+            reasons.append("email")
+        if re.search(r"@[A-Za-z0-9_\-.]{3,}", stripped):
+            score += 1
+            reasons.append("handle")
+        if re.search(
+            r"[\u4e00-\u9fff]{2,}(?:公司|集团|厂|有限责任公司|股份有限公司|"
+            r"事务所|工作室|学校|大学|学院|医院|研究院|协会|基金会)",
+            stripped,
+        ):
+            score += 1
+            reasons.append("organization")
+        lowered = stripped.lower()
+        if any(
+            kw.lower() in lowered
+            for keywords in _DIMENSION_KEYWORDS.values()
+            for kw in keywords
+        ):
+            score += 1
+            reasons.append("dimension_keyword")
+        chinese_tokens = re.findall(r"[\u4e00-\u9fff]{2,4}", stripped)
+        if len(set(chinese_tokens)) >= 2:
+            score += 1
+            reasons.append("multi_name")
+        if stripped.count("\n") >= 2 or len(stripped) >= 60:
+            score += 1
+            reasons.append("structured_dump")
+
+        return {
+            "pipeline": "intel_fusion" if score >= threshold else "simple",
+            "score": score,
+            "threshold": threshold,
+            "reason": ",".join(reasons) or "no_signal",
+        }
 
     @staticmethod
     def detect_structured_input(text: str) -> bool:

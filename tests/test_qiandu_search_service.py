@@ -248,13 +248,35 @@ def test_heuristic_generate_tasks_covers_all_dimensions() -> None:
         assert required in dimensions, f"missing dimension {required}"
 
 
-def test_should_trigger_intel_pipeline_permissive() -> None:
+def test_should_trigger_intel_pipeline_signal_driven() -> None:
     orchestrator = QianduSearchLLMOrchestrator.__new__(QianduSearchLLMOrchestrator)
-    assert orchestrator.should_trigger_intel_pipeline("张三") is True
+    # A bare common Chinese name has no OSINT signal — intel pipeline is
+    # far too expensive to fire for this. Simple pipeline handles it.
+    assert orchestrator.should_trigger_intel_pipeline("张三") is False
+    # Name + dimension keyword → clear OSINT target.
     assert orchestrator.should_trigger_intel_pipeline("张三 深圳 法人") is True
+    # Phone alone is enough (2-point signal).
+    assert orchestrator.should_trigger_intel_pipeline("13800001234") is True
+    # Id number alone is enough.
+    assert orchestrator.should_trigger_intel_pipeline("110101199001011234") is True
+    # Handle + dimension keyword (social).
+    assert orchestrator.should_trigger_intel_pipeline("@alice_li 小红书") is True
     # Bare URLs should not trigger the expensive multi-dimension pipeline.
     assert orchestrator.should_trigger_intel_pipeline("https://example.com/page") is False
     assert orchestrator.should_trigger_intel_pipeline("") is False
+
+
+def test_classify_trigger_returns_scoring_metadata() -> None:
+    orchestrator = QianduSearchLLMOrchestrator.__new__(QianduSearchLLMOrchestrator)
+    verdict = orchestrator.classify_trigger("张三 深圳 法人")
+    assert verdict["pipeline"] == "intel_fusion"
+    assert isinstance(verdict["score"], int) and verdict["score"] >= verdict["threshold"]
+    assert "organization" not in verdict["reason"]  # 深圳 has no company suffix
+    assert "dimension_keyword" in verdict["reason"]
+
+    cheap = orchestrator.classify_trigger("张三")
+    assert cheap["pipeline"] == "simple"
+    assert cheap["score"] < cheap["threshold"]
 
 
 @pytest.mark.asyncio
