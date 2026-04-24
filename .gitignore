@@ -161,3 +161,4 @@ docs_and_notes/*SECRETS*
 docs_and_notes/*.key
 repo_info.json
 create_repo.ps1
+*.tar.gz
