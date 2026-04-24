@@ -1,0 +1,1132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat Oracle</title>
+  <style>
+    :root {
+      --panel: rgba(255, 250, 243, 0.82);
+      --panel-strong: rgba(255, 247, 237, 0.95);
+      --ink: #1f251c;
+      --muted: #697061;
+      --accent: #9f382b;
+      --accent-2: #1c6b63;
+      --border: rgba(31, 37, 28, 0.12);
+      --shadow: 0 20px 50px rgba(78, 54, 32, 0.14);
+      --radius: 22px;
+      --user-bubble: linear-gradient(135deg, #b5482d, #df7e40);
+      --assistant-bubble: rgba(255, 252, 247, 0.94);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Aptos", "Segoe UI Variable", "PingFang SC", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(159,56,43,0.16), transparent 22%),
+        radial-gradient(circle at top right, rgba(28,107,99,0.18), transparent 24%),
+        linear-gradient(180deg, #f7f0e5 0%, #ece1d0 100%);
+      min-height: 100vh;
+    }
+    button, input, textarea, select { font: inherit; }
+    .shell {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      min-height: 100vh;
+    }
+    .sidebar, .main, .auth-card, .billing-card {
+      backdrop-filter: blur(16px);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .sidebar {
+      border-right: 1px solid var(--border);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: 34px;
+      letter-spacing: -0.04em;
+    }
+    .brand p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      line-height: 1.5;
+      font-size: 14px;
+    }
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgba(255,255,255,0.45);
+      padding: 14px;
+    }
+    .sidebar button, .composer button, .auth-card button, .billing-card button {
+      border: none;
+      border-radius: 14px;
+      cursor: pointer;
+      color: white;
+      background: linear-gradient(135deg, var(--accent), #ca5928);
+      padding: 12px 16px;
+      font-weight: 700;
+    }
+    .secondary {
+      background: linear-gradient(135deg, var(--accent-2), #31887d) !important;
+    }
+    .ghost {
+      color: var(--ink) !important;
+      background: rgba(255,255,255,0.62) !important;
+      border: 1px solid var(--border) !important;
+    }
+    .session-list {
+      overflow: auto;
+      display: grid;
+      gap: 10px;
+      max-height: calc(100vh - 320px);
+    }
+    .session-item {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 12px;
+      background: rgba(255,255,255,0.4);
+      transition: transform 0.16s ease, background 0.16s ease;
+    }
+    .session-item:hover { transform: translateY(-1px); background: rgba(255,255,255,0.74); }
+    .session-item.active { border-color: rgba(159,56,43,0.38); background: rgba(255,255,255,0.84); }
+    .session-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+    }
+    .session-main {
+      flex: 1;
+      min-width: 0;
+      cursor: pointer;
+    }
+    .session-main strong {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 6px;
+    }
+    .session-main small { color: var(--muted); display: block; line-height: 1.4; }
+    .tiny-button {
+      width: auto !important;
+      min-width: 0;
+      padding: 8px 10px !important;
+      border-radius: 12px !important;
+      font-size: 12px;
+      line-height: 1;
+    }
+    .account {
+      margin-top: auto;
+      display: grid;
+      gap: 12px;
+    }
+    .main {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      background: rgba(255, 252, 247, 0.38);
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,0.34);
+    }
+    .topbar h2 {
+      margin: 0;
+      font-size: 28px;
+      letter-spacing: -0.04em;
+    }
+    .topbar p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .pill {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(28,107,99,0.12);
+      color: var(--accent-2);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .top-actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+      align-items: center;
+    }
+    .messages {
+      overflow: auto;
+      padding: 24px;
+      display: grid;
+      gap: 18px;
+      align-content: start;
+    }
+    .message {
+      display: grid;
+      gap: 8px;
+      max-width: 860px;
+    }
+    .message.user { justify-self: end; }
+    .message.assistant { justify-self: start; }
+    .message .meta {
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .bubble {
+      padding: 16px 18px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      line-height: 1.7;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .message.user .bubble {
+      color: white;
+      border-color: transparent;
+      background: var(--user-bubble);
+      border-bottom-right-radius: 6px;
+      box-shadow: 0 16px 30px rgba(181, 72, 45, 0.22);
+    }
+    .message.assistant .bubble {
+      background: var(--assistant-bubble);
+      border-bottom-left-radius: 6px;
+    }
+    .composer-wrap {
+      padding: 20px 24px 24px;
+      border-top: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(247,240,229,0.1), rgba(247,240,229,0.88));
+    }
+    .notice {
+      margin-bottom: 14px;
+      border: 1px dashed rgba(159,56,43,0.34);
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: rgba(255, 247, 237, 0.66);
+      color: #7e3a2c;
+      font-size: 14px;
+    }
+    .composer {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: end;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: var(--panel-strong);
+      padding: 14px;
+      box-shadow: var(--shadow);
+    }
+    .composer textarea, .auth-card input {
+      width: 100%;
+      border: 1px solid rgba(31,37,28,0.08);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.94);
+      color: var(--ink);
+      outline: none;
+      padding: 14px;
+    }
+    .composer textarea {
+      resize: none;
+      min-height: 62px;
+      max-height: 200px;
+    }
+    .composer-tools {
+      display: grid;
+      gap: 10px;
+      min-width: 210px;
+    }
+    .composer-tools select, .billing-card select {
+      border: 1px solid rgba(31,37,28,0.08);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255,255,255,0.94);
+      color: var(--ink);
+    }
+    .auth-overlay, .billing-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(237, 224, 205, 0.78);
+      backdrop-filter: blur(12px);
+      display: grid;
+      place-items: center;
+      z-index: 20;
+    }
+    .billing-overlay { display: none; z-index: 25; }
+    .auth-card, .billing-card {
+      width: min(460px, calc(100vw - 32px));
+      border-radius: 28px;
+      border: 1px solid var(--border);
+      padding: 28px;
+    }
+    .billing-card {
+      width: min(980px, calc(100vw - 32px));
+      max-height: calc(100vh - 48px);
+      overflow: auto;
+    }
+    .billing-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 16px;
+      align-items: start;
+    }
+    .plan-grid {
+      display: grid;
+      gap: 12px;
+    }
+    .plan-card {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgba(255,255,255,0.62);
+      padding: 16px;
+      display: grid;
+      gap: 10px;
+    }
+    .plan-card .price {
+      font-size: 30px;
+      letter-spacing: -0.04em;
+    }
+    .tag {
+      display: inline-flex;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(159,56,43,0.12);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .orders {
+      display: grid;
+      gap: 10px;
+    }
+    .order-row {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px;
+      background: rgba(255,255,255,0.62);
+      display: grid;
+      gap: 6px;
+    }
+    .auth-tabs {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+    .auth-tabs button {
+      flex: 1;
+      background: rgba(255,255,255,0.6);
+      color: var(--ink);
+      border: 1px solid var(--border);
+    }
+    .auth-tabs button.active {
+      color: white;
+      border-color: transparent;
+      background: linear-gradient(135deg, var(--accent), #ca5928);
+    }
+    .auth-card h3, .billing-card h3 {
+      margin: 0 0 8px;
+      font-size: 30px;
+      letter-spacing: -0.04em;
+    }
+    .auth-card p, .billing-card p {
+      margin: 0 0 18px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .auth-form {
+      display: grid;
+      gap: 12px;
+    }
+    .helper {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .error {
+      color: #a42323;
+      font-size: 14px;
+      min-height: 20px;
+    }
+    .typing {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 24px;
+    }
+    .typing span {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--muted);
+      animation: pulse 1.2s infinite ease-in-out;
+    }
+    .typing span:nth-child(2) { animation-delay: 0.15s; }
+    .typing span:nth-child(3) { animation-delay: 0.3s; }
+    @keyframes pulse {
+      0%, 80%, 100% { transform: scale(0.7); opacity: 0.5; }
+      40% { transform: scale(1); opacity: 1; }
+    }
+    @media (max-width: 1080px) {
+      .billing-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 980px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .messages { padding: 20px 14px; }
+      .topbar, .composer-wrap { padding-left: 14px; padding-right: 14px; }
+      .composer { grid-template-columns: 1fr; }
+      .composer-tools { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="auth-overlay" id="authOverlay">
+    <div class="auth-card">
+      <div class="auth-tabs">
+        <button id="loginTab" class="active" type="button">登录</button>
+        <button id="registerTab" type="button">注册</button>
+      </div>
+      <h3>Chat Oracle</h3>
+      <p>正式用户聊天入口。登录后可以创建会话、查看历史消息、删除不需要的会话，并直接发起真实订阅支付。</p>
+      <div class="auth-form">
+        <input id="authEmail" type="email" placeholder="邮箱">
+        <input id="authPassword" type="password" placeholder="密码">
+        <button id="authSubmit" type="button">登录并进入</button>
+        <div class="helper">注册后默认会获得 Free 套餐。购买付费套餐后会跳转支付页，并通过回调或主动查单同步订阅状态。</div>
+        <div id="authError" class="error"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="billing-overlay" id="billingOverlay">
+    <div class="billing-card">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:16px;">
+        <div>
+          <h3>订阅与账单</h3>
+          <p id="billingSummary">正在加载套餐和订单信息。</p>
+        </div>
+        <button class="ghost" type="button" onclick="closeBillingModal()">关闭</button>
+      </div>
+      <div id="billingError" class="error"></div>
+      <div class="billing-grid">
+        <section>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <strong>可购买套餐</strong>
+            <button class="ghost tiny-button" type="button" onclick="refreshBillingData()">刷新</button>
+          </div>
+          <div class="plan-grid" id="billingPlans"></div>
+        </section>
+        <section>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <strong>最近订单</strong>
+            <span class="helper">支付成功后刷新本页或重新打开即可看到状态</span>
+          </div>
+          <div class="orders" id="billingOrders"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>Chat Oracle</h1>
+        <p>用户聊天入口。真实会话、真实消息持久化、真实 SSE 流式输出，以及订阅购买与订单台账。</p>
+      </div>
+      <div class="panel">
+        <button type="button" onclick="startNewConversation()">新建会话</button>
+      </div>
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+          <strong>会话列表</strong>
+          <button class="ghost tiny-button" type="button" onclick="loadConversations()">刷新</button>
+        </div>
+        <div class="session-list" id="conversationList"></div>
+      </div>
+      <div class="account panel">
+        <div><strong id="accountEmail">未登录</strong></div>
+        <div class="helper" id="accountPlan">套餐信息未加载</div>
+        <button class="secondary" type="button" onclick="openBillingModal()">订阅与账单</button>
+        <button class="ghost" type="button" onclick="logout()">退出</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <div>
+          <h2 id="conversationTitle">新会话</h2>
+          <p id="conversationMeta">登录后开始提问。系统会优先尝试 `mode.md` 本地模型，不可用时自动切换到 `models.md` 远端模型。</p>
+        </div>
+        <div class="top-actions">
+          <button class="ghost tiny-button" type="button" onclick="startNewConversation()">新会话</button>
+          <button class="secondary tiny-button" type="button" onclick="openBillingModal()">账单</button>
+          <div class="pill" id="modelBadge">模型未选择</div>
+        </div>
+      </div>
+
+      <section class="messages" id="messages">
+        <div class="message assistant">
+          <div class="meta">Assistant</div>
+          <div class="bubble">登录后即可开始对话。当前页面会自动保存登录态、同步会话列表，并用真实 SSE 逐步渲染模型输出。</div>
+        </div>
+      </section>
+
+      <div class="composer-wrap">
+        <div class="notice" id="composerNotice">聊天、会话和订阅支付都是实际链路。完成支付后返回本页即可同步最新订单和套餐状态。</div>
+        <div class="composer">
+          <textarea id="composerInput" placeholder="输入你的消息，按 Enter 发送，Shift+Enter 换行"></textarea>
+          <div class="composer-tools">
+            <select id="modelSelect"></select>
+            <button id="sendButton" type="button">发送消息</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const state = {
+      token: localStorage.getItem("chat_oracle_access_token") || "",
+      currentUser: null,
+      currentSubscription: null,
+      currentPlan: null,
+      availablePlans: [],
+      paymentOrders: [],
+      conversations: [],
+      currentConversationId: null,
+      mode: "login",
+      sending: false,
+      billingPollTimer: null,
+      billingPollStartedAt: 0,
+      billingWatchReason: "",
+      billingWatchTargetPlanCode: "",
+      billingWatchBaselinePlanCode: "",
+    };
+
+    const authOverlay = document.getElementById("authOverlay");
+    const authEmail = document.getElementById("authEmail");
+    const authPassword = document.getElementById("authPassword");
+    const authError = document.getElementById("authError");
+    const authSubmit = document.getElementById("authSubmit");
+    const loginTab = document.getElementById("loginTab");
+    const registerTab = document.getElementById("registerTab");
+    const billingOverlay = document.getElementById("billingOverlay");
+    const billingSummary = document.getElementById("billingSummary");
+    const billingError = document.getElementById("billingError");
+    const billingPlans = document.getElementById("billingPlans");
+    const billingOrders = document.getElementById("billingOrders");
+    const conversationList = document.getElementById("conversationList");
+    const messages = document.getElementById("messages");
+    const composerInput = document.getElementById("composerInput");
+    const sendButton = document.getElementById("sendButton");
+    const modelSelect = document.getElementById("modelSelect");
+    const accountEmail = document.getElementById("accountEmail");
+    const accountPlan = document.getElementById("accountPlan");
+    const conversationTitle = document.getElementById("conversationTitle");
+    const conversationMeta = document.getElementById("conversationMeta");
+    const modelBadge = document.getElementById("modelBadge");
+    const composerNotice = document.getElementById("composerNotice");
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function formatMessageHtml(value) {
+      const escaped = escapeHtml(value).replace(/\n/g, "<br>");
+      return escaped.replace(
+        /(https?:\/\/[^\s<]+)/g,
+        '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
+      );
+    }
+
+    function setAuthMode(mode) {
+      state.mode = mode;
+      loginTab.classList.toggle("active", mode === "login");
+      registerTab.classList.toggle("active", mode === "register");
+      authSubmit.textContent = mode === "login" ? "登录并进入" : "注册并进入";
+      authError.textContent = "";
+    }
+
+    function setToken(token) {
+      state.token = token;
+      if (token) {
+        localStorage.setItem("chat_oracle_access_token", token);
+      } else {
+        localStorage.removeItem("chat_oracle_access_token");
+      }
+    }
+
+    function formatMoney(cents, currency) {
+      return `${(Number(cents || 0) / 100).toFixed(2)} ${currency || "USD"}`;
+    }
+
+    function formatDateTime(value) {
+      if (!value) return "-";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      return date.toLocaleString("zh-CN", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    }
+
+    function updateAccountSummary() {
+      if (!state.currentUser || !state.currentPlan || !state.currentSubscription) {
+        accountEmail.textContent = "未登录";
+        accountPlan.textContent = "套餐信息未加载";
+        return;
+      }
+      accountEmail.textContent = state.currentUser.email;
+      accountPlan.textContent = `${state.currentPlan.name} · 到期 ${formatDateTime(state.currentSubscription.end_at)}`;
+    }
+
+    function setComposerNoticeText(text) {
+      composerNotice.textContent = text;
+    }
+
+    function setBillingErrorText(text) {
+      billingError.textContent = text || "";
+    }
+
+    function describeBillingError(error) {
+      if (error && error.code === "PAYMENT_NOT_CONFIGURED") {
+        return "支付服务尚未配置，暂时不能发起真实扣款。请先补充服务器支付配置。";
+      }
+      if (error && error.code === "AUTH_REQUIRED") {
+        return "登录状态已失效，请重新登录后再查看订阅或发起支付。";
+      }
+      return (error && error.message) ? error.message : "订阅信息加载失败，请稍后再试。";
+    }
+
+    function handleBillingError(error) {
+      const message = describeBillingError(error);
+      billingOverlay.style.display = "grid";
+      billingSummary.textContent = "订阅链路当前不可用。";
+      billingPlans.innerHTML = `<div class="helper">暂时无法加载套餐信息。</div>`;
+      billingOrders.innerHTML = `<div class="helper">暂时无法加载订单信息。</div>`;
+      setBillingErrorText(message);
+      setComposerNoticeText(message);
+      return message;
+    }
+
+    async function request(path, options = {}) {
+      const headers = Object.assign({}, options.headers || {});
+      if (state.token) {
+        headers.Authorization = `Bearer ${state.token}`;
+      }
+      if (!headers["Content-Type"] && options.body) {
+        headers["Content-Type"] = "application/json";
+      }
+      const response = await fetch(path, Object.assign({}, options, { headers }));
+      if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        let payload = null;
+        try {
+          payload = await response.json();
+          detail = payload.detail || detail;
+        } catch (_) {}
+        const error = new Error(detail);
+        error.status = response.status;
+        error.payload = payload;
+        error.code = payload && payload.error_code ? payload.error_code : "";
+        throw error;
+      }
+      if (response.status === 204) {
+        return null;
+      }
+      return response.json();
+    }
+
+    function getPendingOrderForPlan(planCode) {
+      return (state.paymentOrders || []).find((order) => order.plan_code === planCode && order.status === "pending");
+    }
+
+    function getLatestPaidOrder() {
+      return (state.paymentOrders || []).find((order) => order.status === "paid");
+    }
+
+    function getLatestOrderForPlan(planCode) {
+      return (state.paymentOrders || []).find((order) => order.plan_code === planCode);
+    }
+
+    function clearBillingQueryFlag() {
+      const currentUrl = new URL(window.location.href);
+      if (!currentUrl.searchParams.has("billing")) {
+        return;
+      }
+      currentUrl.searchParams.delete("billing");
+      window.history.replaceState({}, "", currentUrl.toString());
+    }
+
+    function stopBillingWatch() {
+      if (state.billingPollTimer) {
+        window.clearTimeout(state.billingPollTimer);
+        state.billingPollTimer = null;
+      }
+      state.billingPollStartedAt = 0;
+      state.billingWatchReason = "";
+      state.billingWatchTargetPlanCode = "";
+      state.billingWatchBaselinePlanCode = "";
+    }
+
+    async function watchBillingStatus() {
+      try {
+        await loadBillingData(true);
+        const targetPlanCode = state.billingWatchTargetPlanCode;
+        const baselinePlanCode = state.billingWatchBaselinePlanCode;
+        const latestTargetOrder = targetPlanCode ? getLatestOrderForPlan(targetPlanCode) : null;
+        if (state.currentPlan && baselinePlanCode && state.currentPlan.code !== baselinePlanCode) {
+          setComposerNoticeText(`支付已确认，当前套餐已升级为 ${state.currentPlan.name}。`);
+          clearBillingQueryFlag();
+          stopBillingWatch();
+          return;
+        }
+        if (
+          latestTargetOrder &&
+          latestTargetOrder.status === "paid" &&
+          new Date(latestTargetOrder.created_at).getTime() >= state.billingPollStartedAt - 10000
+        ) {
+          setComposerNoticeText(`订单 ${latestTargetOrder.merchant_order_id} 已支付成功。`);
+          clearBillingQueryFlag();
+          stopBillingWatch();
+          return;
+        }
+        const hasPendingOrder = (state.paymentOrders || []).some((order) => order.status === "pending");
+        const exceededWindow = Date.now() - state.billingPollStartedAt > 90000;
+        if (!hasPendingOrder || exceededWindow) {
+          if (exceededWindow) {
+            setComposerNoticeText("支付结果仍在同步中，可稍后打开“订阅与账单”继续查看。");
+          }
+          clearBillingQueryFlag();
+          stopBillingWatch();
+          return;
+        }
+      } catch (_) {
+        // Ignore transient polling failures and retry on next tick.
+      }
+      state.billingPollTimer = window.setTimeout(watchBillingStatus, 3000);
+    }
+
+    function beginBillingWatch(reason, targetPlanCode = "") {
+      stopBillingWatch();
+      state.billingPollStartedAt = Date.now();
+      state.billingWatchReason = reason;
+      state.billingWatchTargetPlanCode = targetPlanCode;
+      state.billingWatchBaselinePlanCode = state.currentPlan ? state.currentPlan.code : "";
+      state.billingPollTimer = window.setTimeout(watchBillingStatus, 3000);
+    }
+
+    function renderModels() {
+      const models = (state.currentPlan && state.currentPlan.allowed_models_json && state.currentPlan.allowed_models_json.length)
+        ? state.currentPlan.allowed_models_json
+        : ["gemma-4-e2b-q6_k_p", "gemma/gemma-4-31B-Mystery-Fine-Tune-HERETIC-UNCENSORED-INSTRUCT-Q4_K_S.gguf"];
+      modelSelect.innerHTML = models.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join("");
+      if (models.length) {
+        modelBadge.textContent = models[0];
+      }
+    }
+
+    function renderConversations() {
+      if (!state.conversations.length) {
+        conversationList.innerHTML = `<div class="helper">暂无历史会话。</div>`;
+        return;
+      }
+      conversationList.innerHTML = state.conversations.map((item) => `
+        <div class="session-item ${item.id === state.currentConversationId ? "active" : ""}">
+          <div class="session-row">
+            <div class="session-main" data-open="${item.id}">
+              <strong>${escapeHtml(item.title || "未命名会话")}</strong>
+              <small>${escapeHtml(item.message_count)} 条消息</small>
+              <small>${escapeHtml(item.latest_model || "尚未调用模型")}</small>
+            </div>
+            <button class="ghost tiny-button" type="button" data-delete="${item.id}">删除</button>
+          </div>
+        </div>
+      `).join("");
+      Array.from(conversationList.querySelectorAll("[data-open]")).forEach((element) => {
+        element.addEventListener("click", () => openConversation(element.dataset.open));
+      });
+      Array.from(conversationList.querySelectorAll("[data-delete]")).forEach((element) => {
+        element.addEventListener("click", (event) => {
+          event.stopPropagation();
+          deleteConversation(element.dataset.delete);
+        });
+      });
+    }
+
+    function renderMessage(role, text, pending = false) {
+      const wrapper = document.createElement("div");
+      wrapper.className = `message ${role}`;
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = role === "user" ? "You" : "Assistant";
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.innerHTML = pending ? `<div class="typing"><span></span><span></span><span></span></div>` : formatMessageHtml(text);
+      wrapper.append(meta, bubble);
+      messages.appendChild(wrapper);
+      messages.scrollTop = messages.scrollHeight;
+      return bubble;
+    }
+
+    function resetMessages() {
+      messages.innerHTML = `
+        <div class="message assistant">
+          <div class="meta">Assistant</div>
+          <div class="bubble">开始一个新会话，或者从左侧历史会话继续。</div>
+        </div>
+      `;
+    }
+
+    function renderBilling() {
+      billingSummary.textContent = state.currentPlan && state.currentSubscription
+        ? `当前套餐：${state.currentPlan.name}，状态 ${state.currentSubscription.status}，到期 ${formatDateTime(state.currentSubscription.end_at)}。`
+        : "尚未加载当前套餐。";
+      billingPlans.innerHTML = (state.availablePlans || []).map((plan) => {
+        const isCurrent = state.currentPlan && plan.code === state.currentPlan.code;
+        const isFree = Number(plan.monthly_price_cents) === 0;
+        const pendingOrder = getPendingOrderForPlan(plan.code);
+        const features = Object.keys(plan.features_json || {});
+        const buttonLabel = isCurrent ? "当前使用中" : isFree ? "免费套餐" : pendingOrder ? "继续支付" : "购买订阅";
+        return `
+          <div class="plan-card">
+            <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
+              <div>
+                <strong>${escapeHtml(plan.name)}</strong>
+                <div class="helper">${escapeHtml(plan.code)}</div>
+              </div>
+              ${isCurrent ? '<span class="tag">当前套餐</span>' : ''}
+            </div>
+            <div class="price">${formatMoney(plan.monthly_price_cents, plan.currency)}</div>
+            <div class="helper">模型：${plan.allowed_models_json.map((item) => escapeHtml(item)).join(" / ") || "未配置"}</div>
+            <div class="helper">功能：${features.length ? features.map((item) => escapeHtml(item)).join(" / ") : "标准对话"}</div>
+            ${pendingOrder ? `<div class="helper">待支付订单：${escapeHtml(pendingOrder.merchant_order_id)}${pendingOrder.expires_at ? ` · 到期 ${escapeHtml(formatDateTime(pendingOrder.expires_at))}` : ""}</div>` : ""}
+            <button type="button" ${isCurrent || isFree ? "disabled" : ""} onclick="startCheckout('${plan.code}')">${buttonLabel}</button>
+          </div>
+        `;
+      }).join("") || `<div class="helper">暂无可购买套餐。</div>`;
+
+      billingOrders.innerHTML = (state.paymentOrders || []).map((order) => `
+        <div class="order-row">
+          <strong>${escapeHtml(order.plan_name)} / ${escapeHtml(order.plan_code)}</strong>
+          <div class="helper">状态：${escapeHtml(order.status)} · 金额：${formatMoney(order.amount_cents, order.currency)}</div>
+          ${order.actual_amount ? `<div class="helper">链上应付：${escapeHtml(order.actual_amount)} · 收款地址：${escapeHtml(order.payment_address || "-")}</div>` : ""}
+          <div class="helper">商户单号：${escapeHtml(order.merchant_order_id)}</div>
+          <div class="helper">trade_id：${escapeHtml(order.provider_trade_id || "-")}${order.block_transaction_id ? ` · 链上交易：${escapeHtml(order.block_transaction_id)}` : ""}</div>
+          <div class="helper">创建：${escapeHtml(order.created_at)}${order.paid_at ? ` · 支付：${escapeHtml(order.paid_at)}` : ""}</div>
+          ${order.checkout_url ? `<button class="secondary" type="button" onclick="window.open('${escapeHtml(order.checkout_url)}', '_blank', 'noopener')">打开支付页</button>` : ""}
+        </div>
+      `).join("") || `<div class="helper">暂无订单记录。</div>`;
+    }
+
+    async function loginOrRegister() {
+      authError.textContent = "";
+      const email = authEmail.value.trim();
+      const password = authPassword.value;
+      if (!email || !password) {
+        authError.textContent = "请输入邮箱和密码。";
+        return;
+      }
+      try {
+        const path = state.mode === "login" ? "/v1/auth/login" : "/v1/auth/register";
+        const data = await request(path, {
+          method: "POST",
+          body: JSON.stringify({ email, password }),
+        });
+        setToken(data.tokens.access_token);
+        await bootstrap();
+      } catch (error) {
+        authError.textContent = error.message;
+      }
+    }
+
+    async function bootstrap() {
+      const me = await request("/v1/users/me");
+      state.currentUser = me.user;
+      state.currentSubscription = me.subscription;
+      state.currentPlan = me.plan;
+      updateAccountSummary();
+      renderModels();
+      await loadConversations();
+      authOverlay.style.display = "none";
+      if (url.searchParams.get("billing") === "success") {
+        await openBillingModal();
+        setComposerNoticeText("已从支付页返回，正在同步最新订单和订阅状态。");
+        beginBillingWatch("payment-return");
+      }
+    }
+
+    async function loadConversations() {
+      const data = await request("/v1/conversations");
+      state.conversations = data.items || [];
+      renderConversations();
+      if (state.currentConversationId) {
+        const existing = state.conversations.find((item) => item.id === state.currentConversationId);
+        if (!existing) {
+          await startNewConversation();
+        }
+      }
+    }
+
+    async function openConversation(conversationId) {
+      const payload = await request(`/v1/conversations/${conversationId}/messages`);
+      state.currentConversationId = conversationId;
+      conversationTitle.textContent = payload.conversation.title || "未命名会话";
+      conversationMeta.textContent = `${payload.conversation.message_count} 条消息`;
+      messages.innerHTML = "";
+      (payload.messages || []).forEach((item) => renderMessage(item.role, item.content_text));
+      renderConversations();
+    }
+
+    async function startNewConversation() {
+      state.currentConversationId = null;
+      conversationTitle.textContent = "新会话";
+      conversationMeta.textContent = "发送第一条消息后会自动创建会话";
+      resetMessages();
+      renderConversations();
+    }
+
+    async function deleteConversation(conversationId) {
+      if (!confirm("删除后该会话会从你的列表中移除，继续吗？")) {
+        return;
+      }
+      await request(`/v1/conversations/${conversationId}`, { method: "DELETE" });
+      if (state.currentConversationId === conversationId) {
+        await startNewConversation();
+      }
+      await loadConversations();
+    }
+
+    async function loadBillingData(syncPending = false) {
+      const ordersRequest = syncPending
+        ? request("/v1/subscriptions/orders/sync", { method: "POST" })
+        : request("/v1/subscriptions/orders");
+      const [plansPayload, ordersPayload, me] = await Promise.all([
+        request("/v1/subscriptions/plans"),
+        ordersRequest,
+        request("/v1/users/me"),
+      ]);
+      state.availablePlans = plansPayload.items || [];
+      state.paymentOrders = ordersPayload.items || [];
+      state.currentSubscription = me.subscription;
+      state.currentPlan = me.plan;
+      updateAccountSummary();
+      renderModels();
+      setBillingErrorText("");
+      renderBilling();
+    }
+
+    async function openBillingModal() {
+      billingOverlay.style.display = "grid";
+      billingSummary.textContent = "正在加载套餐和订单信息。";
+      billingPlans.innerHTML = `<div class="helper">正在加载套餐信息。</div>`;
+      billingOrders.innerHTML = `<div class="helper">正在加载订单信息。</div>`;
+      setBillingErrorText("");
+      try {
+        await loadBillingData(true);
+      } catch (error) {
+        handleBillingError(error);
+      }
+    }
+
+    function closeBillingModal() {
+      billingOverlay.style.display = "none";
+    }
+
+    async function refreshBillingData() {
+      try {
+        await loadBillingData(true);
+      } catch (error) {
+        handleBillingError(error);
+      }
+    }
+
+    async function startCheckout(planCode) {
+      const popup = window.open("about:blank", "_blank", "noopener");
+      if (popup && popup.document) {
+        popup.document.write("<title>跳转支付</title><body style='font-family:sans-serif;padding:24px'>正在跳转到支付页...</body>");
+      }
+      try {
+        const data = await request("/v1/subscriptions/checkout-session", {
+          method: "POST",
+          body: JSON.stringify({ plan_code: planCode }),
+        });
+        await loadBillingData(true);
+        if (!data.checkout_url) {
+          throw new Error(data.detail || "未返回支付链接");
+        }
+        if (popup) {
+          popup.location.href = data.checkout_url;
+        } else {
+          window.location.href = data.checkout_url;
+        }
+        setComposerNoticeText(`已创建 ${planCode} 的支付订单，请完成支付后返回本页。`);
+        beginBillingWatch("checkout-created", planCode);
+      } catch (error) {
+        if (popup && !popup.closed) {
+          popup.close();
+        }
+        const message = handleBillingError(error);
+        alert(message || "发起支付失败");
+      }
+    }
+
+    async function sendMessage() {
+      if (state.sending) return;
+      const content = composerInput.value.trim();
+      if (!content) return;
+      state.sending = true;
+      sendButton.disabled = true;
+      composerInput.value = "";
+      renderMessage("user", content);
+      const assistantBubble = renderMessage("assistant", "", true);
+      const requestedModel = modelSelect.value;
+      modelBadge.textContent = requestedModel;
+
+      try {
+        const response = await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${state.token}`,
+          },
+          body: JSON.stringify({
+            conversation_id: state.currentConversationId,
+            messages: [{ role: "user", content }],
+            model: requestedModel,
+            stream: true,
+          }),
+        });
+        if (!response.ok || !response.body) {
+          let detail = `HTTP ${response.status}`;
+          let payload = null;
+          try {
+            payload = await response.json();
+            detail = payload.detail || detail;
+          } catch (_) {}
+          if (payload && (payload.error_code === "MODEL_NOT_ALLOWED" || payload.error_code === "SUBSCRIPTION_REQUIRED")) {
+            setComposerNoticeText("当前套餐不支持本次请求，已为你打开订阅入口。");
+            openBillingModal().catch(() => {});
+          }
+          throw new Error(detail);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let fullText = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split("\n\n");
+          buffer = parts.pop() || "";
+          for (const block of parts) {
+            if (!block.trim()) continue;
+            if (block.startsWith("event: error")) {
+              const match = block.split("\n").find((line) => line.startsWith("data: "));
+              const payload = match ? JSON.parse(match.slice(6)) : { detail: "stream error" };
+              throw new Error(payload.detail || "stream error");
+            }
+            const line = block.split("\n").find((entry) => entry.startsWith("data: "));
+            if (!line) continue;
+            const data = line.slice(6);
+            if (data === "[DONE]") continue;
+            const payload = JSON.parse(data);
+            const choice = (payload.choices || [])[0] || {};
+            const delta = choice.delta || {};
+            if (delta.content) {
+              fullText += delta.content;
+              assistantBubble.innerHTML = formatMessageHtml(fullText);
+              messages.scrollTop = messages.scrollHeight;
+            }
+            if (!state.currentConversationId && payload.conversation_id) {
+              state.currentConversationId = payload.conversation_id;
+            }
+          }
+        }
+
+        if (!fullText) {
+          assistantBubble.innerHTML = "模型未返回内容。";
+        }
+        await loadConversations();
+        if (state.currentConversationId) {
+          const current = state.conversations.find((item) => item.id === state.currentConversationId);
+          if (current) {
+            conversationTitle.textContent = current.title || "未命名会话";
+            conversationMeta.textContent = `${current.message_count} 条消息`;
+          }
+        }
+      } catch (error) {
+        assistantBubble.innerHTML = `<span style="color:#a42323">${escapeHtml(error.message)}</span>`;
+      } finally {
+        state.sending = false;
+        sendButton.disabled = false;
+        composerInput.focus();
+      }
+    }
+
+    function logout() {
+      stopBillingWatch();
+      setToken("");
+      state.currentUser = null;
+      state.currentSubscription = null;
+      state.currentPlan = null;
+      state.availablePlans = [];
+      state.paymentOrders = [];
+      state.conversations = [];
+      state.currentConversationId = null;
+      accountEmail.textContent = "未登录";
+      accountPlan.textContent = "套餐信息未加载";
+      conversationTitle.textContent = "新会话";
+      conversationMeta.textContent = "登录后开始提问。";
+      closeBillingModal();
+      resetMessages();
+      renderConversations();
+      authOverlay.style.display = "grid";
+    }
+
+    loginTab.addEventListener("click", () => setAuthMode("login"));
+    registerTab.addEventListener("click", () => setAuthMode("register"));
+    authSubmit.addEventListener("click", loginOrRegister);
+    sendButton.addEventListener("click", sendMessage);
+    composerInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        sendMessage();
+      }
+    });
+
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("billing") === "success") {
+      setComposerNoticeText("支付页面已返回，系统将自动同步最新订单状态。");
+    }
+
+    if (state.token) {
+      bootstrap().catch(() => logout());
+    } else {
+      setAuthMode("login");
+    }
+  </script>
+</body>
+</html>

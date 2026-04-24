@@ -1,0 +1,13 @@
+http://chat.202574.xyz, https://chat.202574.xyz {
+	encode gzip zstd
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	reverse_proxy 127.0.0.1:18000 {
+		flush_interval -1
+	}
+}

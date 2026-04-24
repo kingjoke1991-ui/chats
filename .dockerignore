@@ -1,0 +1,9 @@
+.git
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+_template_benavlabs
+k.key
+k_ssh.key

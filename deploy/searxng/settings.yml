@@ -1,0 +1,37 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - baidu
+      - sogou
+
+general:
+  debug: false
+  instance_name: "Chat Oracle SearXNG"
+
+search:
+  safe_search: 0
+  autocomplete: "sogou"
+  default_lang: "zh-CN"
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "chat-oracle-searxng-secret"
+  limiter: false
+  image_proxy: false
+  bind_address: "0.0.0.0"
+
+engines:
+  - name: baidu
+    disabled: false
+  - name: sogou
+    disabled: false
+
+outgoing:
+  request_timeout: 15.0
+  proxies:
+    http://:
+      - socks5h://BSYhylcbmD:OOEFzfTGBi@43.140.221.227:12222
+    https://:
+      - socks5h://BSYhylcbmD:OOEFzfTGBi@43.140.221.227:12222

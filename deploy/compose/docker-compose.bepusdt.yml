@@ -1,0 +1,9 @@
+services:
+  bepusdt:
+    image: v03413/bepusdt:latest
+    container_name: bepusdt
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - /opt/bepusdt/data:/var/lib/bepusdt

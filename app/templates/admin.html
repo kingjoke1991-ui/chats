@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat Oracle Admin</title>
+  <style>
+    :root {
+      --bg: #f4efe5;
+      --panel: rgba(255, 250, 244, 0.84);
+      --ink: #182018;
+      --muted: #5b6255;
+      --accent: #9c2f24;
+      --accent-2: #275d52;
+      --border: rgba(24, 32, 24, 0.12);
+      --shadow: 0 18px 50px rgba(68, 44, 28, 0.12);
+      --radius: 20px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Aptos", "Segoe UI Variable", "PingFang SC", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(156,47,36,0.14), transparent 28%),
+        radial-gradient(circle at top right, rgba(39,93,82,0.18), transparent 24%),
+        linear-gradient(180deg, #f8f3ea 0%, #efe7da 100%);
+      min-height: 100vh;
+    }
+    .shell {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 28px 18px 48px;
+    }
+    .hero {
+      display: grid;
+      grid-template-columns: 1.3fr 0.9fr;
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+      padding: 18px;
+    }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: 42px; letter-spacing: -0.03em; margin-bottom: 10px; }
+    .sub { color: var(--muted); line-height: 1.55; max-width: 72ch; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin: 18px 0;
+    }
+    .metric {
+      padding: 16px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.62);
+      border: 1px solid rgba(24,32,24,0.08);
+    }
+    .metric small { display: block; color: var(--muted); margin-bottom: 10px; }
+    .metric strong { font-size: 28px; letter-spacing: -0.03em; }
+    .login {
+      display: grid;
+      gap: 10px;
+    }
+    input, select, button, textarea {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(24,32,24,0.12);
+      background: rgba(255,255,255,0.92);
+      font: inherit;
+      color: inherit;
+    }
+    button {
+      cursor: pointer;
+      background: linear-gradient(135deg, var(--accent), #c94d2b);
+      color: white;
+      border: none;
+      font-weight: 700;
+    }
+    button.secondary { background: linear-gradient(135deg, var(--accent-2), #368270); }
+    button.ghost {
+      color: var(--ink);
+      background: rgba(255,255,255,0.64);
+      border: 1px solid rgba(24,32,24,0.12);
+    }
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .toolbar input, .toolbar select, .toolbar button { width: auto; flex: 1 1 180px; }
+    .section-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      align-items: start;
+      margin-top: 18px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      text-align: left;
+      padding: 12px 10px;
+      border-bottom: 1px solid rgba(24,32,24,0.08);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: rgba(39,93,82,0.1);
+      color: var(--accent-2);
+    }
+    .log {
+      white-space: pre-wrap;
+      line-height: 1.55;
+      color: var(--muted);
+      min-height: 180px;
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 13px;
+    }
+    .header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .button-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .button-row button {
+      width: auto;
+      min-width: 90px;
+    }
+    @media (max-width: 1024px) {
+      .hero, .section-grid, .grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 720px) {
+      .hero, .section-grid, .grid { grid-template-columns: 1fr; }
+      h1 { font-size: 32px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="hero">
+      <section class="panel">
+        <h1>Chat Oracle Admin</h1>
+        <p class="sub">集中查看用户、模型节点、套餐、支付订单和会话健康度。后台页面直接调用现有管理 API，适合日常运营和一线排障。</p>
+        <div class="grid" id="metrics"></div>
+      </section>
+      <section class="panel">
+        <div class="header-row">
+          <div>
+            <h2>管理员登录</h2>
+            <p class="sub">使用管理员账号登录后，页面会缓存 access token 并自动刷新主要运营数据。</p>
+          </div>
+          <span class="pill" id="authState">未登录</span>
+        </div>
+        <div class="login">
+          <input id="email" type="email" placeholder="admin@example.com">
+          <input id="password" type="password" placeholder="密码">
+          <button id="loginBtn">登录并加载后台</button>
+          <button id="logoutBtn" class="secondary">退出</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="section-grid">
+      <section class="panel">
+        <div class="header-row">
+          <h2>用户管理</h2>
+          <button class="secondary" id="refreshUsers">刷新用户</button>
+        </div>
+        <div class="toolbar">
+          <input id="userSearch" placeholder="搜索邮箱或用户名">
+          <select id="userStatus">
+            <option value="">全部状态</option>
+            <option value="active">active</option>
+            <option value="suspended">suspended</option>
+            <option value="deleted">deleted</option>
+          </select>
+        </div>
+        <div style="overflow:auto">
+          <table id="usersTable"></table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="header-row">
+          <h2>节点管理</h2>
+          <button class="secondary" id="refreshNodes">刷新节点</button>
+        </div>
+        <div style="overflow:auto">
+          <table id="nodesTable"></table>
+        </div>
+      </section>
+    </div>
+
+    <div class="section-grid">
+      <section class="panel">
+        <div class="header-row">
+          <h2>套餐与价格</h2>
+          <div class="button-row">
+            <button class="secondary" id="refreshPlans">刷新套餐</button>
+            <button id="createPlanBtn">新增套餐</button>
+          </div>
+        </div>
+        <div style="overflow:auto">
+          <table id="plansTable"></table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="header-row">
+          <h2>支付订单</h2>
+          <button class="secondary" id="refreshOrders">刷新订单</button>
+        </div>
+        <div class="toolbar">
+          <input id="orderSearch" placeholder="搜索邮箱、套餐、商户单号或 trade id">
+        </div>
+        <div style="overflow:auto">
+          <table id="ordersTable"></table>
+        </div>
+      </section>
+    </div>
+
+    <div class="section-grid">
+      <section class="panel">
+        <div class="header-row">
+          <h2>会话查询</h2>
+          <button class="secondary" id="refreshConversations">刷新会话</button>
+        </div>
+        <div class="toolbar">
+          <input id="conversationSearch" placeholder="搜索邮箱或会话标题">
+        </div>
+        <div style="overflow:auto">
+          <table id="conversationsTable"></table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="header-row">
+          <h2>失败请求与消息链</h2>
+          <button class="secondary" id="refreshFailed">刷新失败请求</button>
+        </div>
+        <div style="overflow:auto; margin-bottom: 14px;">
+          <table id="failedTable"></table>
+        </div>
+        <div class="log" id="messageLog">点击会话 ID 后，这里显示完整消息链。</div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      token: localStorage.getItem("chat_oracle_admin_token") || "",
+      plans: [],
+    };
+
+    const authState = document.getElementById("authState");
+    const messageLog = document.getElementById("messageLog");
+
+    function setAuthState(text) {
+      authState.textContent = text;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function formatMoney(cents, currency) {
+      return `${(Number(cents || 0) / 100).toFixed(2)} ${currency || "USD"}`;
+    }
+
+    function metricCard(label, value) {
+      return `<div class="metric"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong></div>`;
+    }
+
+    async function request(path, options = {}) {
+      const headers = Object.assign({}, options.headers || {});
+      if (state.token) {
+        headers.Authorization = `Bearer ${state.token}`;
+      }
+      if (!headers["Content-Type"] && options.body) {
+        headers["Content-Type"] = "application/json";
+      }
+      const response = await fetch(path, Object.assign({}, options, { headers }));
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `HTTP ${response.status}`);
+      }
+      if (response.status === 204) {
+        return null;
+      }
+      return response.json();
+    }
+
+    async function loadOverview() {
+      const data = await request("/v1/admin/metrics/overview");
+      document.getElementById("metrics").innerHTML = [
+        metricCard("总用户", data.total_users),
+        metricCard("活跃订阅", data.active_subscriptions),
+        metricCard("总会话", data.total_conversations),
+        metricCard("总消息", data.total_messages),
+        metricCard("今日成功 assistant", data.assistant_success_today),
+        metricCard("今日失败 assistant", data.assistant_failed_today),
+        metricCard("今日 tokens", data.tokens_today),
+      ].join("");
+    }
+
+    async function loadUsers() {
+      const search = document.getElementById("userSearch").value;
+      const status = document.getElementById("userStatus").value;
+      const query = new URLSearchParams();
+      if (search) query.set("search", search);
+      if (status) query.set("status", status);
+      const data = await request(`/v1/admin/users?${query.toString()}`);
+      const rows = data.items.map((item) => `
+        <tr>
+          <td>${escapeHtml(item.email)}<br><small>${escapeHtml(item.id)}</small></td>
+          <td>${escapeHtml(item.plan_code || "-")}</td>
+          <td>${escapeHtml(item.status)}${item.is_admin ? " / admin" : ""}</td>
+          <td>${escapeHtml(item.last_login_at || "-")}</td>
+          <td><button onclick="toggleUserStatus('${item.id}', '${item.status === "active" ? "suspended" : "active"}')">${item.status === "active" ? "封禁" : "解封"}</button></td>
+        </tr>
+      `).join("");
+      document.getElementById("usersTable").innerHTML = `
+        <thead><tr><th>用户</th><th>套餐</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead>
+        <tbody>${rows}</tbody>
+      `;
+    }
+
+    async function loadNodes() {
+      const data = await request("/v1/admin/nodes");
+      const rows = data.map((item) => `
+        <tr>
+          <td>${escapeHtml(item.code)}<br><small>${escapeHtml(item.model_name)}</small></td>
+          <td>${escapeHtml(item.status)}${item.enabled ? "" : " / disabled"}</td>
+          <td>${escapeHtml(item.weight)}</td>
+          <td>${escapeHtml(item.priority)}</td>
+          <td><button onclick="toggleNode('${item.id}', ${!item.enabled})">${item.enabled ? "停用" : "启用"}</button></td>
+        </tr>
+      `).join("");
+      document.getElementById("nodesTable").innerHTML = `
+        <thead><tr><th>节点</th><th>状态</th><th>权重</th><th>优先级</th><th>操作</th></tr></thead>
+        <tbody>${rows}</tbody>
+      `;
+    }
+
+    async function loadPlans() {
+      const data = await request("/v1/admin/plans");
+      state.plans = data.items || [];
+      const rows = state.plans.map((item) => `
+        <tr>
+          <td>${escapeHtml(item.code)}<br><small>${escapeHtml(item.name)}</small></td>
+          <td>${formatMoney(item.monthly_price_cents, item.currency)}</td>
+          <td>${escapeHtml(item.priority_level)}</td>
+          <td>${item.allowed_models_json.map((value) => escapeHtml(value)).join("<br>") || "-"}</td>
+          <td>${item.is_active ? "active" : "inactive"}</td>
+          <td><button onclick="editPlan('${item.id}')">编辑</button></td>
+        </tr>
+      `).join("");
+      document.getElementById("plansTable").innerHTML = `
+        <thead><tr><th>套餐</th><th>月费</th><th>优先级</th><th>可用模型</th><th>启用</th><th>操作</th></tr></thead>
+        <tbody>${rows}</tbody>
+      `;
+    }
+
+    async function loadPaymentOrders() {
+      const search = document.getElementById("orderSearch").value;
+      const query = new URLSearchParams();
+      if (search) query.set("search", search);
+      const data = await request(`/v1/admin/payment-orders?${query.toString()}`);
+      const rows = data.items.map((item) => `
+        <tr>
+          <td>${escapeHtml(item.user_email)}<br><small>${escapeHtml(item.merchant_order_id)}</small></td>
+          <td>${escapeHtml(item.plan_code)} / ${escapeHtml(item.plan_name)}</td>
+          <td>${formatMoney(item.amount_cents, item.currency)}</td>
+          <td>${escapeHtml(item.status)}<br><small>${escapeHtml(item.provider_trade_id || "-")}</small></td>
+          <td>${escapeHtml(item.created_at)}<br><small>${escapeHtml(item.paid_at || item.expires_at || "-")}</small></td>
+        </tr>
+      `).join("");
+      document.getElementById("ordersTable").innerHTML = `
+        <thead><tr><th>用户 / 商户单号</th><th>套餐</th><th>金额</th><th>状态 / trade</th><th>时间</th></tr></thead>
+        <tbody>${rows}</tbody>
+      `;
+    }
+
+    async function loadConversations() {
+      const search = document.getElementById("conversationSearch").value;
+      const query = new URLSearchParams();
+      if (search) query.set("search", search);
+      const data = await request(`/v1/admin/conversations?${query.toString()}`);
+      const rows = data.items.map((item) => `
+        <tr>
+          <td><button class="secondary" onclick="loadConversationMessages('${item.id}')">${escapeHtml(item.id)}</button></td>
+          <td>${escapeHtml(item.user_email)}</td>
+          <td>${escapeHtml(item.title || "-")}</td>
+          <td>${escapeHtml(item.message_count)}</td>
+          <td>${escapeHtml(item.latest_model || "-")}</td>
+        </tr>
+      `).join("");
+      document.getElementById("conversationsTable").innerHTML = `
+        <thead><tr><th>ID</th><th>用户</th><th>标题</th><th>消息数</th><th>模型</th></tr></thead>
+        <tbody>${rows}</tbody>
+      `;
+    }
+
+    async function loadFailedMessages() {
+      const data = await request("/v1/admin/failed-messages");
+      const rows = data.items.map((item) => `
+        <tr>
+          <td>${escapeHtml(item.created_at)}</td>
+          <td>${escapeHtml(item.error_code || "-")}</td>
+          <td>${escapeHtml(item.error_message || "-")}</td>
+          <td><button class="secondary" onclick="loadConversationMessages('${item.conversation_id}')">${escapeHtml(item.conversation_id)}</button></td>
+        </tr>
+      `).join("");
+      document.getElementById("failedTable").innerHTML = `
+        <thead><tr><th>时间</th><th>错误码</th><th>错误</th><th>会话</th></tr></thead>
+        <tbody>${rows}</tbody>
+      `;
+    }
+
+    async function loadConversationMessages(conversationId) {
+      const data = await request(`/v1/admin/conversations/${conversationId}/messages`);
+      const lines = data.messages.map((message) => `[${message.role}] ${message.status}\n${message.content_text}`).join("\n\n");
+      messageLog.textContent = lines || "该会话暂无消息。";
+    }
+
+    async function login() {
+      const email = document.getElementById("email").value;
+      const password = document.getElementById("password").value;
+      const data = await request("/v1/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+      });
+      if (!data.user.is_admin) {
+        throw new Error("当前账号不是管理员");
+      }
+      state.token = data.tokens.access_token;
+      localStorage.setItem("chat_oracle_admin_token", state.token);
+      setAuthState(`已登录 ${data.user.email}`);
+      await reloadAll();
+    }
+
+    async function reloadAll() {
+      await Promise.all([
+        loadOverview(),
+        loadUsers(),
+        loadNodes(),
+        loadPlans(),
+        loadPaymentOrders(),
+        loadConversations(),
+        loadFailedMessages(),
+      ]);
+    }
+
+    async function toggleUserStatus(userId, nextStatus) {
+      await request(`/v1/admin/users/${userId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: nextStatus }),
+      });
+      await loadUsers();
+    }
+
+    async function toggleNode(nodeId, enabled) {
+      await request(`/v1/admin/nodes/${nodeId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled }),
+      });
+      await loadNodes();
+    }
+
+    async function editPlan(planId) {
+      const plan = state.plans.find((item) => item.id === planId);
+      if (!plan) return;
+      const name = prompt("套餐名称", plan.name);
+      if (name === null) return;
+      const price = prompt("月费价格（分）", String(plan.monthly_price_cents));
+      if (price === null) return;
+      const active = confirm(`是否保持套餐 ${plan.code} 为启用状态？`);
+      const models = prompt("可用模型，使用英文逗号分隔", (plan.allowed_models_json || []).join(","));
+      if (models === null) return;
+      const features = prompt("features_json，输入 JSON", JSON.stringify(plan.features_json || {}, null, 2));
+      if (features === null) return;
+      await request(`/v1/admin/plans/${plan.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name,
+          monthly_price_cents: Number(price),
+          allowed_models_json: models.split(",").map((item) => item.trim()).filter(Boolean),
+          features_json: JSON.parse(features),
+          is_active: active,
+        }),
+      });
+      await loadPlans();
+    }
+
+    async function createPlan() {
+      const code = prompt("套餐 code，例如 pro_plus", "");
+      if (!code) return;
+      const name = prompt("套餐名称", "");
+      if (!name) return;
+      const monthlyPrice = prompt("月费价格（分）", "2999");
+      if (monthlyPrice === null) return;
+      const models = prompt("可用模型，英文逗号分隔", "gemma-4-e2b-q6_k_p");
+      if (models === null) return;
+      const payload = {
+        code,
+        name,
+        monthly_price_cents: Number(monthlyPrice),
+        currency: "USD",
+        monthly_soft_token_limit: 50000000,
+        daily_soft_token_limit: 2000000,
+        max_concurrent_requests: 2,
+        max_input_tokens: 64000,
+        max_output_tokens: 4096,
+        max_context_tokens: 64000,
+        priority_level: 60,
+        allowed_models_json: models.split(",").map((item) => item.trim()).filter(Boolean),
+        features_json: { stream: true, billing_period_days: 30 },
+        is_active: true,
+      };
+      await request("/v1/admin/plans", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      await loadPlans();
+    }
+
+    document.getElementById("loginBtn").addEventListener("click", async () => {
+      try {
+        await login();
+      } catch (error) {
+        alert(error.message);
+      }
+    });
+
+    document.getElementById("logoutBtn").addEventListener("click", () => {
+      state.token = "";
+      localStorage.removeItem("chat_oracle_admin_token");
+      setAuthState("未登录");
+      location.reload();
+    });
+
+    document.getElementById("refreshUsers").addEventListener("click", () => loadUsers().catch((error) => alert(error.message)));
+    document.getElementById("refreshNodes").addEventListener("click", () => loadNodes().catch((error) => alert(error.message)));
+    document.getElementById("refreshPlans").addEventListener("click", () => loadPlans().catch((error) => alert(error.message)));
+    document.getElementById("refreshOrders").addEventListener("click", () => loadPaymentOrders().catch((error) => alert(error.message)));
+    document.getElementById("refreshConversations").addEventListener("click", () => loadConversations().catch((error) => alert(error.message)));
+    document.getElementById("refreshFailed").addEventListener("click", () => loadFailedMessages().catch((error) => alert(error.message)));
+    document.getElementById("createPlanBtn").addEventListener("click", () => createPlan().catch((error) => alert(error.message)));
+    document.getElementById("userSearch").addEventListener("change", () => loadUsers().catch((error) => alert(error.message)));
+    document.getElementById("userStatus").addEventListener("change", () => loadUsers().catch((error) => alert(error.message)));
+    document.getElementById("orderSearch").addEventListener("change", () => loadPaymentOrders().catch((error) => alert(error.message)));
+    document.getElementById("conversationSearch").addEventListener("change", () => loadConversations().catch((error) => alert(error.message)));
+
+    if (state.token) {
+      setAuthState("已缓存登录态");
+      reloadAll().catch(() => setAuthState("登录态失效"));
+    }
+  </script>
+</body>
+</html>
