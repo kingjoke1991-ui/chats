@@ -40,4 +40,14 @@ reverse_proxy 127.0.0.1:18000 {
 
 ---
 
+### ERR-003: Windows 到 Linux 的大文件/多目录同步效率瓶颈
+- **技术栈 (Tech Stack)**: PowerShell, SSH, tar, Docker Compose.
+- **错误点 (Error Point)**: 传统的 `scp -r` 在同步包含大量源码文件或深层目录结构（尤其是包含虚拟环境或 `.git` 时）速度极慢，且难以做到原子性更新。
+- **诱因 (Root Cause)**: SCP 采用逐个文件传输协议，对于小文件极多的场景 IO 等待严重。
+- **解决方案 (Resolution)**: 
+  - 第一步：使用 Windows 10+ 自带的 `tar` 工具将 `app`, `deploy`, `migrations` 等核心目录打包。
+  - 第二步：通过 `scp` 一次性上传压缩包（减少连接建立开销）。
+  - 第三步：利用 SSH 组合指令完成“解压 -> 构建 -> 清理”闭环：`cd path && tar -xzf project.tar.gz && docker compose up -d --build app && rm project.tar.gz`。
+- **结果**: 实现秒级代码同步，且保证了远程端代码在构建前的完整性。
+
 *更多条目将在后续开发中持续添加*
