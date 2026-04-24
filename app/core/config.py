@@ -158,6 +158,7 @@ class Settings(BaseSettings):
     qiandu_max_context_chars: int = Field(default=14000, alias="QIANDU_MAX_CONTEXT_CHARS")
     qiandu_max_evidence_chunks: int = Field(default=8, alias="QIANDU_MAX_EVIDENCE_CHUNKS")
     qiandu_max_document_chars: int = Field(default=24000, alias="QIANDU_MAX_DOCUMENT_CHARS")
+    qiandu_report_inline_max_chars: int = Field(default=6000, alias="QIANDU_REPORT_INLINE_MAX_CHARS")
     qiandu_snoop_command: str | None = Field(default=None, alias="QIANDU_SNOOP_COMMAND")
     qiandu_wechat_crawler_command: str | None = Field(default=None, alias="QIANDU_WECHAT_CRAWLER_COMMAND")
     qiandu_crawl4ai_enabled: bool = Field(default=True, alias="QIANDU_CRAWL4AI_ENABLED")

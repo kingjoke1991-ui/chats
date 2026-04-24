@@ -18,6 +18,163 @@ from app.services.qiandu_search.models import (
 )
 
 
+# Intent / task-type vocabulary used throughout the pipeline.
+# 8 个综合查询维度 + general 兜底。
+QIANDU_INTENT_CHOICES: set[str] = {
+    "general",
+    "social_id",
+    "wechat",
+    "legal_entity",  # alias of business
+    "person",
+    "company",       # alias of business
+    "business",      # 工商 / 企查
+    "judicial",      # 裁判文书 / 执行 / 失信
+    "education",     # 学历 / 院校 / 学信
+    "profession",    # 职业 / 任职 / LinkedIn / 脉脉 / boss
+    "social",        # 微博 / 小红书 / 抖音 / 知乎 / B 站
+    "news",          # 新闻 / 舆情
+}
+
+
+# Domain allowlists per dimension. Used both by heuristic task generation and
+# by the scoring layer to boost on-topic sources.
+QIANDU_DOMAIN_ALLOWLIST: dict[str, list[str]] = {
+    "business": [
+        "qcc.com",
+        "aiqicha.baidu.com",
+        "tianyancha.com",
+        "qixin.com",
+        "qyjia.com",
+        "qianzhan.com",
+    ],
+    "judicial": [
+        "wenshu.court.gov.cn",
+        "zxgk.court.gov.cn",
+        "court.gov.cn",
+        "zgcpws.com",
+        "judicourt.com",
+        "12309.gov.cn",
+        "shixin.court.gov.cn",
+    ],
+    "education": [
+        "xuexin.com",
+        "chsi.com.cn",
+        "xlcx.chsi.com.cn",
+        "edu.cn",
+        "moe.gov.cn",
+        "cnki.net",
+        "wanfangdata.com.cn",
+        "hanspub.org",
+    ],
+    "profession": [
+        "linkedin.com",
+        "maimai.cn",
+        "zhipin.com",
+        "liepin.com",
+        "zhaopin.com",
+        "51job.com",
+        "lagou.com",
+    ],
+    "social": [
+        "weibo.com",
+        "xiaohongshu.com",
+        "douyin.com",
+        "bilibili.com",
+        "zhihu.com",
+        "douban.com",
+        "jianshu.com",
+        "csdn.net",
+    ],
+    "wechat": ["mp.weixin.qq.com"],
+    "news": [
+        "people.com.cn",
+        "xinhuanet.com",
+        "sina.com.cn",
+        "sohu.com",
+        "163.com",
+        "thepaper.cn",
+        "qq.com",
+        "ifeng.com",
+        "thecover.cn",
+    ],
+}
+
+
+# Keywords that hint at each dimension in free-form Chinese input.
+_DIMENSION_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "business": (
+        "法人",
+        "股东",
+        "注册资本",
+        "统一社会信用代码",
+        "公司",
+        "企业",
+        "工商",
+        "企查",
+        "企查查",
+        "天眼查",
+        "爱企查",
+    ),
+    "judicial": (
+        "裁判",
+        "文书",
+        "判决",
+        "判决书",
+        "法院",
+        "执行",
+        "失信",
+        "被执行人",
+        "诉讼",
+        "立案",
+        "涉诉",
+        "老赖",
+    ),
+    "education": (
+        "学历",
+        "学籍",
+        "毕业",
+        "院校",
+        "本科",
+        "硕士",
+        "博士",
+        "大学",
+        "学校",
+        "学信",
+        "学位",
+        "教育背景",
+    ),
+    "profession": (
+        "任职",
+        "职业",
+        "职位",
+        "工作",
+        "履历",
+        "简历",
+        "从业",
+        "linkedin",
+        "脉脉",
+        "boss",
+        "招聘",
+    ),
+    "social": (
+        "微博",
+        "小红书",
+        "抖音",
+        "快手",
+        "b站",
+        "bilibili",
+        "知乎",
+        "豆瓣",
+        "账号",
+        "uid",
+        "id",
+        "@",
+    ),
+    "wechat": ("公众号", "微信", "公号", "wechat", "mp.weixin"),
+    "news": ("新闻", "舆情", "报道", "媒体", "新闻稿"),
+}
+
+
 class QianduSearchLLMOrchestrator:
     def __init__(self, session: AsyncSession):
         self.model_nodes = ModelNodeRepo(session)
@@ -37,23 +194,26 @@ class QianduSearchLLMOrchestrator:
         prompt = (
             "You are a China-focused search planner for an intelligence assistant. Output JSON only.\n"
             "Return this schema:\n"
-            '{'
+            "{"
             '"queries":["..."],'
-            '"intent":"general|social_id|wechat|legal_entity|person|company",'
+            '"intent":"general|social|social_id|wechat|business|legal_entity|judicial|education|profession|person|company|news",'
             '"topic":"general|news",'
             '"time_range":"day|week|month|year|null",'
             '"include_domains":["..."],'
             '"exclude_domains":["..."],'
             '"preferred_providers":["snoop","wechat_crawler","tavily","exa","searxng"]'
-            '}\n'
+            "}\n"
             "Rules:\n"
             "- Keep 1 to 4 queries.\n"
-            "- If the target looks like a Chinese social-media handle, username, phone, or account ID, prefer intent=social_id and add Weibo-style queries.\n"
-            "- If the target mentions 公众号, 微信, 微信公众号, 或公号, prefer intent=wechat and include mp.weixin.qq.com.\n"
-            "- If the target is a company, 法人, 股东, enterprise info, or judicial/court records (诉讼, 判决, 法院), prefer intent=legal_entity and prioritize qcc.com and court.gov.cn.\n"
-            "- Use snoop and wechat_crawler only when the target matches their strengths.\n"
+            "- For social account / handle lookups use intent=social (or social_id).\n"
+            "- For 公众号 use intent=wechat and prefer mp.weixin.qq.com.\n"
+            "- For 工商 / 法人 / 股东 / 企业 info use intent=business and prefer qcc.com, tianyancha.com, aiqicha.baidu.com.\n"
+            "- For 诉讼 / 判决 / 执行 / 失信 use intent=judicial and prefer wenshu.court.gov.cn and zxgk.court.gov.cn.\n"
+            "- For 教育 / 学历 / 院校 / 毕业 use intent=education.\n"
+            "- For 职业 / 任职 / 履历 use intent=profession.\n"
+            "- For 新闻 / 舆情 use topic=news.\n"
             "- Avoid spam, mirrors, SEO wrappers, and marketplaces.\n"
-            "- Return valid JSON and nothing else."
+            "- Return valid JSON only."
         )
 
         try:
@@ -87,7 +247,7 @@ class QianduSearchLLMOrchestrator:
 
         fallback = self._heuristic_plan(query_text)
         intent = str(parsed.get("intent") or fallback.intent).strip().lower()
-        if intent not in {"general", "social_id", "wechat", "legal_entity", "person", "company"}:
+        if intent not in QIANDU_INTENT_CHOICES:
             intent = fallback.intent
 
         topic = str(parsed.get("topic") or fallback.topic).strip().lower()
@@ -139,11 +299,12 @@ class QianduSearchLLMOrchestrator:
             for index, item in enumerate(evidence_chunks, start=1)
         )
         prompt = (
-            "你是一个犀利、克制、以证据为中心的中文检索分析助手。\n"
+            "你是一个以证据为中心的中文综合查询分析助手。\n"
             "只允许基于给定证据回答，不要编造。\n"
             "先给直接结论，再给关键依据，再给不确定点。\n"
             "引用证据时使用 [1] [2] 编号。\n"
-            "如果对象可能是社交账号、公众号或企业主体，优先指出可核实字段。"
+            "如果目标是社交账号、公众号、企业主体、司法记录、教育背景或职业信息，"
+            "优先指出该维度下可核实的字段。"
         )
 
         try:
@@ -167,8 +328,36 @@ class QianduSearchLLMOrchestrator:
         except Exception:
             return self._fallback_answer(query_text, evidence_chunks)
 
+    def should_trigger_intel_pipeline(self, text: str) -> bool:
+        """Decide whether to use the comprehensive multi-dimension intel pipeline.
+
+        This is intentionally much more permissive than `detect_structured_input`.
+        The old detector only fired when the input looked like a pasted profile
+        record, which meant the vast majority of `#千度` queries degraded to a
+        single-intent plan. For proper 综合查询 we want the pipeline to fire
+        whenever the input plausibly identifies a real-world entity.
+        """
+
+        if not text:
+            return False
+        stripped = text.strip()
+        if len(stripped) < 2:
+            return False
+
+        # Looks like a bare URL — no point exploding into multi-dimension tasks.
+        if re.match(r"^https?://\S+$", stripped):
+            return False
+
+        return True
+
     @staticmethod
     def detect_structured_input(text: str) -> bool:
+        """Retained for backwards compatibility with legacy tests / callers.
+
+        Fires only for large pasted structured dumps. New callers should use
+        `should_trigger_intel_pipeline`.
+        """
+
         if not text or len(text) < 50:
             return False
         if "数据来源" in text or text.count("\n") > 5:
@@ -187,7 +376,7 @@ class QianduSearchLLMOrchestrator:
     ) -> QianduIntelExtraction:
         node = await self._select_node(requested_model=requested_model, allowed_models=allowed_models)
         if not node:
-             raise ValueError("No valid LLM node available for extraction")
+            return self.heuristic_entity_extraction(raw_input)
 
         prompt = (
             "你是一个“信息解析与任务规划引擎”，你的目标不是回答问题，而是：\n"
@@ -202,33 +391,40 @@ class QianduSearchLLMOrchestrator:
             '  "id_numbers": [],\n'
             '  "addresses": [{"province": "", "city": "", "district": "", "detail": ""}],\n'
             '  "organizations": [],\n'
-            '  "other_fields": {"邮箱": [], "车牌": []},\n'
+            '  "other_fields": {"邮箱": [], "车牌": [], "社交账号": []},\n'
             '  "data_quality": "low/medium/high"\n'
             "}\n"
         )
 
-        response_text = await self._run_prompt(
-            node=node,
-            messages=[
-                ChatMessageInput(role="system", content=prompt),
-                ChatMessageInput(role="user", content=f"【输入数据】\n{raw_input}"),
-            ],
-            temperature=0.1,
-            max_tokens=1000,
-        )
+        try:
+            response_text = await self._run_prompt(
+                node=node,
+                messages=[
+                    ChatMessageInput(role="system", content=prompt),
+                    ChatMessageInput(role="user", content=f"【输入数据】\n{raw_input}"),
+                ],
+                temperature=0.1,
+                max_tokens=1000,
+            )
+        except Exception:
+            return self.heuristic_entity_extraction(raw_input)
+
         response_text = self._clean_llm_response(response_text)
         parsed = self._parse_json_object(response_text) or {}
-        return QianduIntelExtraction(
-            summary=parsed.get("summary", ""),
-            names=self._ensure_str_list(parsed.get("names", [])),
-            phones=self._ensure_str_list(parsed.get("phones", [])),
-            id_numbers=self._ensure_str_list(parsed.get("id_numbers", [])),
-            addresses=parsed.get("addresses", []),
-            organizations=self._ensure_str_list(parsed.get("organizations", [])),
-            other_fields=parsed.get("other_fields", {}),
-            data_quality=parsed.get("data_quality", "medium"),
+
+        fallback = self.heuristic_entity_extraction(raw_input)
+        extraction = QianduIntelExtraction(
+            summary=str(parsed.get("summary") or "").strip() or fallback.summary,
+            names=self._ensure_str_list(parsed.get("names")) or fallback.names,
+            phones=self._ensure_str_list(parsed.get("phones")) or fallback.phones,
+            id_numbers=self._ensure_str_list(parsed.get("id_numbers")) or fallback.id_numbers,
+            addresses=parsed.get("addresses") if isinstance(parsed.get("addresses"), list) else fallback.addresses,
+            organizations=self._ensure_str_list(parsed.get("organizations")) or fallback.organizations,
+            other_fields=parsed.get("other_fields") if isinstance(parsed.get("other_fields"), dict) else fallback.other_fields,
+            data_quality=str(parsed.get("data_quality") or "").strip() or fallback.data_quality,
             raw_input=raw_input,
         )
+        return extraction
 
     async def generate_search_tasks(
         self,
@@ -239,49 +435,64 @@ class QianduSearchLLMOrchestrator:
     ) -> list[QianduSearchTask]:
         node = await self._select_node(requested_model=requested_model, allowed_models=allowed_models)
         if not node:
-             raise ValueError("No valid LLM node available for task generation")
+            return self.heuristic_generate_tasks(extraction)
 
-        normalized_data = json.dumps({
-            "names": extraction.names,
-            "phones": extraction.phones,
-            "id_numbers": extraction.id_numbers,
-            "organizations": extraction.organizations,
-            "addresses": extraction.addresses,
-        }, ensure_ascii=False)
+        normalized_data = json.dumps(
+            {
+                "summary": extraction.summary,
+                "names": extraction.names,
+                "phones": extraction.phones,
+                "id_numbers": extraction.id_numbers,
+                "organizations": extraction.organizations,
+                "addresses": extraction.addresses,
+                "other_fields": extraction.other_fields,
+                "raw_input": extraction.raw_input,
+            },
+            ensure_ascii=False,
+        )
 
         prompt = (
-            "你是一个“大陆OSINT搜索策略引擎”。目标：基于已有结构化数据，定位目标在大陆的网络足迹与商业/司法关联。\n"
+            "你是一个“大陆综合 OSINT 搜索策略引擎”。目标：基于已有结构化数据，"
+            "覆盖目标在大陆的 工商/司法/教育/职业/社交/微信/新闻 等维度的网络足迹。\n"
             "【关键策略 - 必须执行】\n"
-            "- 必须使用大陆特定术语：如“法定代表人”、“股东情况”、“执行信息”、“失信记录”作为查询关键词。\n"
-            "- 强制生成组合查询：[姓名 + 精准地理位置]、[姓名 + 身份证前6位]、[姓名 + 手机前3后4]。\n"
+            "- 必须使用大陆特定术语：如“法定代表人”、“股东情况”、“执行信息”、“失信记录”、"
+            "“裁判文书”、“学历认证”、“任职”、“简历” 作为查询关键词。\n"
+            "- 为 工商/司法/教育/职业/社交/微信/新闻 每个维度**至少生成一个任务**"
+            "（如果与目标相关）。\n"
+            "- 强制生成组合查询：[姓名 + 精准地理位置]、[姓名 + 组织]、"
+            "[姓名 + 手机前3后4]。\n"
             "- 禁止生成过于笼统的查询（如只搜姓名）。\n"
-            "- 识别：LinkedIn/Facebook等海外站点在大陆重名率极高且价值极低，必须通过增加组合关键词来过滤。\n"
-            "内置自我反思：检查任务是否更偏向大陆本土数据源（爱企查/裁判文书/微博/小红书）。\n"
+            "- LinkedIn / Facebook 等海外站点在大陆重名率极高，只有 intent=profession 且明确提到"
+            "海外履历时才纳入。\n"
             "【输出格式】必须是JSON：\n"
             "{\n"
             '  "tasks": [\n'
             '    {\n'
             '      "task_id": "t1",\n'
-            '      "task_type": "legal_entity",\n'
-            '      "query": "姓名 + 地域/公司 裁判文书",\n'
-            '      "goal": "核实大陆司法记录与商业关联",\n'
+            '      "task_type": "business|judicial|education|profession|social|wechat|news",\n'
+            '      "query": "姓名 + 地域 法人",\n'
+            '      "goal": "",\n'
             '      "priority": 1,\n'
-            '      "include_domains": ["court.gov.cn", "qcc.com", "aiqicha.baidu.com"],\n'
-            '      "preferred_providers": ["searxng", "tavily"]\n'
-            '    }\n'
+            '      "include_domains": ["qcc.com"],\n'
+            '      "preferred_providers": ["tavily", "searxng"]\n'
+            "    }\n"
             "  ]\n"
             "}\n"
         )
 
-        response_text = await self._run_prompt(
-            node=node,
-            messages=[
-                ChatMessageInput(role="system", content=prompt),
-                ChatMessageInput(role="user", content=f"【可用数据】\n{normalized_data}"),
-            ],
-            temperature=0.2,
-            max_tokens=1000,
-        )
+        try:
+            response_text = await self._run_prompt(
+                node=node,
+                messages=[
+                    ChatMessageInput(role="system", content=prompt),
+                    ChatMessageInput(role="user", content=f"【可用数据】\n{normalized_data}"),
+                ],
+                temperature=0.2,
+                max_tokens=1200,
+            )
+        except Exception:
+            return self.heuristic_generate_tasks(extraction)
+
         response_text = self._clean_llm_response(response_text)
         parsed = self._parse_json_object(response_text) or {}
         tasks_data = parsed.get("tasks", [])
@@ -292,10 +503,11 @@ class QianduSearchLLMOrchestrator:
             query = str(item.get("query") or "").strip()
             if not query:
                 continue
+            task_type = str(item.get("task_type") or "entity_lookup").strip().lower()
             results.append(
                 QianduSearchTask(
                     task_id=str(item.get("task_id") or f"task_{index}"),
-                    task_type=str(item.get("task_type") or "entity_lookup"),
+                    task_type=task_type,
                     query=query,
                     goal=str(item.get("goal") or ""),
                     priority=int(item.get("priority") or 2),
@@ -303,7 +515,12 @@ class QianduSearchLLMOrchestrator:
                     preferred_providers=self._normalize_providers(item.get("preferred_providers")),
                 )
             )
-        return results[:settings.qiandu_max_search_tasks]
+
+        if not results:
+            return self.heuristic_generate_tasks(extraction)
+
+        merged = self._merge_task_lists(results, self.heuristic_generate_tasks(extraction))
+        return merged[: settings.qiandu_max_search_tasks]
 
     async def fuse_intel_report(
         self,
@@ -313,50 +530,370 @@ class QianduSearchLLMOrchestrator:
         allowed_models: list[str],
         requested_model: str | None,
     ) -> str:
+        if not search_results:
+            return self._heuristic_intel_report(extraction, search_results)
+
         node = await self._select_node(requested_model=requested_model, allowed_models=allowed_models)
         if not node:
-             return "无法合成最终情报报告"
+            return self._heuristic_intel_report(extraction, search_results)
 
         evidence_text = "\n\n".join(
-            f"[{index}] {item.title}\nURL: {item.url}\n{item.text}"
+            f"[{index}] {item.title}\nURL: {item.url}\nkind={item.metadata.get('task_type', item.metadata.get('kind', ''))}\n{item.text}"
             for index, item in enumerate(search_results, start=1)
         )
 
         prompt = (
-            "你是一个“大陆情报深度分析引擎”。\n"
-            "任务：汇总原始数据与最新的外部搜索结果，生成一份【针对大陆背景】的增量式情报报告。\n"
-            "【报告指引】\n"
-            "1. 优先级：优先呈现来自 爱企查、天眼查、裁判文书网、微博、知乎、小红书 等大陆本土平台的新事实。\n"
-            "2. 噪音剔除：LinkedIn、Facebook 等全球性站点的结果在搜索“张三、李四”类常见中文名时极易产生误报。如果证据[n]中的人员职位与原始数据环境不符，必须果断剔除或标记为“高度疑似误报”。\n"
-            "3. 核心新发现：不仅要列出姓名，更要列出其名下的公司占股、司法纠纷的具体案号、或是某个社交平台的精准UID。\n"
-            "4. 逻辑：利用搜索到的“新关联”来补完原始数据的“空白点”。\n"
-            "输出一份极具深度的大陆背景情报报告。使用 Markdown 格式，引用证据请使用 [1] [2] 编号。"
+            "你是一个“大陆综合 OSINT 情报分析引擎”。\n"
+            "任务：基于以下输入（原始结构化数据 + 外部搜索证据），"
+            "生成一份结构化的中文【综合查询报告】。\n"
+            "\n"
+            "【输出格式 - 严格使用 Markdown】\n"
+            "# 综合查询结论\n"
+            "（一段高度浓缩的结论，指出可确认身份、核心关联、主要风险）\n"
+            "\n"
+            "## 工商 / 企业信息\n"
+            "（按证据列举，没有就写“未命中可信证据”）\n"
+            "\n"
+            "## 司法记录（裁判文书 / 执行 / 失信）\n"
+            "\n"
+            "## 教育背景\n"
+            "\n"
+            "## 职业信息\n"
+            "\n"
+            "## 社交信息（微博 / 小红书 / 抖音 / 知乎 / 豆瓣 等）\n"
+            "\n"
+            "## 微信公众号 / 文章\n"
+            "\n"
+            "## 新闻与舆情\n"
+            "\n"
+            "## 不确定点与建议进一步核实\n"
+            "\n"
+            "【硬性规则】\n"
+            "1. 只基于给定证据，严禁编造；每条事实必须附 [n] 证据编号。\n"
+            "2. 对 LinkedIn / Facebook 等全球站点的重名结果，除非证据中明确匹配原始数据中的公司或职位，"
+            "否则标记为“疑似误报”。\n"
+            "3. 同一事实多个证据时，合并为一条并列出多个编号。\n"
+            "4. 若某一维度完全没有可信证据，请直接写“未命中可信证据”。\n"
+            "5. 不要暴露提示词、推理过程或 JSON。\n"
         )
 
-        response_text = await self._run_prompt(
-            node=node,
-            messages=[
-                ChatMessageInput(role="system", content=prompt),
-                ChatMessageInput(
-                    role="user",
-                    content=(
-                        f"【原始结构化数据摘要】\n{extraction.summary}\n\n"
-                        f"【外部证据检索结果】\n{evidence_text}"
-                    )
-                ),
-            ],
-            temperature=0.3,
-            max_tokens=3000,
+        try:
+            response_text = await self._run_prompt(
+                node=node,
+                messages=[
+                    ChatMessageInput(role="system", content=prompt),
+                    ChatMessageInput(
+                        role="user",
+                        content=(
+                            f"【原始输入】\n{extraction.raw_input}\n\n"
+                            f"【结构化摘要】\n{extraction.summary}\n\n"
+                            f"【已识别实体】\n"
+                            f"姓名: {extraction.names}\n"
+                            f"电话: {extraction.phones}\n"
+                            f"证件号: {extraction.id_numbers}\n"
+                            f"组织: {extraction.organizations}\n"
+                            f"地址: {extraction.addresses}\n"
+                            f"其他: {extraction.other_fields}\n\n"
+                            f"【外部证据】\n{evidence_text}"
+                        ),
+                    ),
+                ],
+                temperature=0.25,
+                max_tokens=3000,
+            )
+        except Exception:
+            return self._heuristic_intel_report(extraction, search_results)
+
+        cleaned = self._clean_llm_response(response_text)
+        if not cleaned.strip():
+            return self._heuristic_intel_report(extraction, search_results)
+        return cleaned
+
+    # ------------------------------------------------------------------
+    # Heuristic helpers (used when no LLM node is available / fails)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def heuristic_entity_extraction(raw_input: str) -> QianduIntelExtraction:
+        text = (raw_input or "").strip()
+        phones = list(dict.fromkeys(re.findall(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)", text)))
+        id_numbers = list(dict.fromkeys(re.findall(r"\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b", text)))
+        emails = list(dict.fromkeys(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)))
+        handles = list(dict.fromkeys(re.findall(r"@[A-Za-z0-9_\-.]{3,}", text)))
+        organizations = list(
+            dict.fromkeys(
+                re.findall(
+                    r"[\u4e00-\u9fff]{2,}(?:公司|集团|厂|有限责任公司|股份有限公司|事务所|工作室|学校|大学|学院|医院|研究院|协会|基金会)",
+                    text,
+                )
+            )
         )
-        return self._clean_llm_response(response_text)
+        names: list[str] = []
+        # Pull out Chinese 2-4 character names that sit next to common labels,
+        # e.g. "姓名：张三" / "客户: 李四".
+        for match in re.finditer(r"(?:姓名|名字|客户|目标|人员|用户)[：:\s]*([\u4e00-\u9fff]{2,4})", text):
+            names.append(match.group(1))
+        # Fall back to any standalone 2-4 char Chinese word that isn't an org.
+        if not names:
+            organization_chars = set("".join(organizations))
+            for token in re.findall(r"[\u4e00-\u9fff]{2,4}", text):
+                if token in names:
+                    continue
+                if any(word in token for word in ("公司", "集团", "学校", "大学", "医院", "学院")):
+                    continue
+                if set(token).issubset(organization_chars) and organizations:
+                    continue
+                names.append(token)
+                if len(names) >= 4:
+                    break
+        names = list(dict.fromkeys(names))
+
+        quality = "low"
+        if phones or id_numbers:
+            quality = "high"
+        elif names or organizations or emails or handles:
+            quality = "medium"
+
+        summary_bits: list[str] = []
+        if names:
+            summary_bits.append(f"姓名={','.join(names[:3])}")
+        if organizations:
+            summary_bits.append(f"组织={','.join(organizations[:3])}")
+        if phones:
+            summary_bits.append(f"电话={','.join(phones[:2])}")
+        if id_numbers:
+            summary_bits.append(f"证件={','.join(id_numbers[:1])}")
+        summary = "；".join(summary_bits) or text[:80]
+
+        other_fields: dict[str, list[str]] = {}
+        if emails:
+            other_fields["邮箱"] = emails[:5]
+        if handles:
+            other_fields["社交账号"] = handles[:10]
+
+        return QianduIntelExtraction(
+            summary=summary,
+            names=names[:6],
+            phones=phones[:4],
+            id_numbers=id_numbers[:2],
+            addresses=[],
+            organizations=organizations[:5],
+            other_fields=other_fields,
+            data_quality=quality,
+            raw_input=text,
+        )
+
+    @staticmethod
+    def heuristic_generate_tasks(extraction: QianduIntelExtraction) -> list[QianduSearchTask]:
+        """Fallback task generator covering the 综合查询 dimensions."""
+
+        targets: list[str] = []
+        targets.extend(extraction.names)
+        targets.extend(extraction.organizations)
+        handles = extraction.other_fields.get("社交账号") if isinstance(extraction.other_fields, dict) else None
+        if isinstance(handles, list):
+            targets.extend([str(item).strip() for item in handles if item])
+        primary = next((t for t in targets if t), "")
+        if not primary:
+            primary = extraction.raw_input.strip().split("\n", 1)[0][:40]
+        if not primary:
+            return []
+
+        phone = extraction.phones[0] if extraction.phones else ""
+        id_number = extraction.id_numbers[0] if extraction.id_numbers else ""
+        org = extraction.organizations[0] if extraction.organizations else ""
+
+        def _task(
+            task_id: str,
+            task_type: str,
+            query: str,
+            *,
+            preferred_providers: list[str] | None = None,
+            include_domains: list[str] | None = None,
+            priority: int = 2,
+        ) -> QianduSearchTask:
+            return QianduSearchTask(
+                task_id=task_id,
+                task_type=task_type,
+                query=query.strip(),
+                goal="",
+                priority=priority,
+                include_domains=include_domains or list(QIANDU_DOMAIN_ALLOWLIST.get(task_type, [])),
+                preferred_providers=preferred_providers or ["tavily", "exa", "searxng"],
+            )
+
+        tasks: list[QianduSearchTask] = []
+
+        # 工商
+        tasks.append(
+            _task(
+                "biz",
+                "business",
+                " ".join(filter(None, [primary, org, "法人 股东 企查查"])),
+                priority=1,
+            )
+        )
+        # 司法
+        tasks.append(
+            _task(
+                "jud",
+                "judicial",
+                " ".join(filter(None, [primary, org, "裁判文书 判决书 执行"])),
+                priority=1,
+            )
+        )
+        # 教育
+        tasks.append(
+            _task(
+                "edu",
+                "education",
+                " ".join(filter(None, [primary, org, "学历 毕业 院校"])),
+            )
+        )
+        # 职业
+        tasks.append(
+            _task(
+                "pro",
+                "profession",
+                " ".join(filter(None, [primary, org, "任职 简历 履历"])),
+            )
+        )
+        # 社交
+        tasks.append(
+            _task(
+                "soc",
+                "social",
+                " ".join(filter(None, [primary, "微博 小红书 抖音 知乎"])),
+                preferred_providers=["tavily", "searxng", "snoop"],
+            )
+        )
+        # 微信
+        tasks.append(
+            _task(
+                "wx",
+                "wechat",
+                " ".join(filter(None, [primary, org, "公众号"])),
+                preferred_providers=["wechat_crawler", "tavily", "searxng"],
+                include_domains=["mp.weixin.qq.com"],
+            )
+        )
+        # 新闻
+        tasks.append(
+            _task(
+                "news",
+                "news",
+                " ".join(filter(None, [primary, org, "新闻 报道"])),
+            )
+        )
+
+        # Strong identifiers: add targeted follow-up tasks.
+        if phone:
+            tasks.append(
+                _task(
+                    "phone",
+                    "general",
+                    f"{primary} {phone}",
+                    priority=1,
+                    include_domains=[],
+                )
+            )
+        if id_number:
+            tasks.append(
+                _task(
+                    "id",
+                    "general",
+                    f"{primary} {id_number[:6]}",
+                    priority=1,
+                    include_domains=[],
+                )
+            )
+
+        return tasks[: settings.qiandu_max_search_tasks]
+
+    @staticmethod
+    def _merge_task_lists(
+        primary: list[QianduSearchTask],
+        secondary: list[QianduSearchTask],
+    ) -> list[QianduSearchTask]:
+        seen_types = {task.task_type for task in primary}
+        merged = list(primary)
+        for task in secondary:
+            if task.task_type in seen_types:
+                continue
+            merged.append(task)
+            seen_types.add(task.task_type)
+        return merged
+
+    @staticmethod
+    def _heuristic_intel_report(
+        extraction: QianduIntelExtraction,
+        search_results: list[QianduEvidenceChunk],
+    ) -> str:
+        buckets: dict[str, list[tuple[int, QianduEvidenceChunk]]] = {
+            "business": [],
+            "judicial": [],
+            "education": [],
+            "profession": [],
+            "social": [],
+            "wechat": [],
+            "news": [],
+            "other": [],
+        }
+        label_map = {
+            "business": "工商 / 企业信息",
+            "judicial": "司法记录（裁判文书 / 执行 / 失信）",
+            "education": "教育背景",
+            "profession": "职业信息",
+            "social": "社交信息",
+            "wechat": "微信公众号 / 文章",
+            "news": "新闻与舆情",
+            "other": "其他线索",
+        }
+        for index, chunk in enumerate(search_results, start=1):
+            task_type = str(chunk.metadata.get("task_type") or "").lower()
+            if task_type in {"legal_entity", "company"}:
+                task_type = "business"
+            if task_type in {"social_id"}:
+                task_type = "social"
+            if task_type in {"person", "general", ""}:
+                task_type = "other"
+            buckets.setdefault(task_type, buckets["other"]).append((index, chunk))
+
+        summary = (extraction.summary or extraction.raw_input.strip())[:140]
+        lines: list[str] = [
+            "# 综合查询结论",
+            summary or "基于输入尚未识别到明确实体。",
+            "",
+        ]
+
+        for key in ["business", "judicial", "education", "profession", "social", "wechat", "news", "other"]:
+            items = buckets.get(key) or []
+            lines.append(f"## {label_map[key]}")
+            if not items:
+                lines.append("未命中可信证据。")
+            else:
+                for index, chunk in items[:5]:
+                    preview = chunk.text.strip().replace("\n", " ")
+                    if len(preview) > 240:
+                        preview = preview[:237] + "..."
+                    lines.append(f"- [{index}] {chunk.title}：{preview}")
+                    lines.append(f"  - {chunk.url}")
+            lines.append("")
+
+        lines.append("## 不确定点与建议进一步核实")
+        lines.append(
+            "本报告由启发式合成引擎生成，未经过大模型交叉验证。"
+            "请结合来源链接核对每条线索，重点关注姓名相近但单位不同的潜在误报。"
+        )
+        return "\n".join(lines).strip()
 
     def _clean_llm_response(self, text: str) -> str:
         if not text:
             return ""
         # Remove common thought/reasoning tags
-        text = re.sub(r'<(?:thought|reasoning|thinking|details)>.*?</(?:thought|reasoning|thinking|details)>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<(?:thought|reasoning|thinking|details)>.*?</(?:thought|reasoning|thinking|details)>", "", text, flags=re.DOTALL | re.IGNORECASE)
         # Remove markers like "Thought:", "Reasoning:", etc. at the start of blocks
-        text = re.sub(r'^(?:Thought|Reasoning|Thinking|Analysis):\s*.*?(?=\n\n|\n[#\d])', '', text, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+        text = re.sub(r"^(?:Thought|Reasoning|Thinking|Analysis):\s*.*?(?=\n\n|\n[#\d])", "", text, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
         return text.strip()
 
     @staticmethod
@@ -443,27 +980,38 @@ class QianduSearchLLMOrchestrator:
         include_domains: list[str] = []
         preferred_providers = ["tavily", "exa", "searxng"]
 
-        social_keywords = ("微博", "抖音", "快手", "小红书", "账号", "id", "uid", "@")
-        wechat_keywords = ("公众号", "微信", "公号", "wechat")
-        legal_keywords = ("法人", "股东", "注册资本", "统一社会信用代码", "公司", "企业", "工商", "企查查", "裁判", "文书", "判决书", "法院", "执行")
-        news_keywords = ("最新", "今天", "最近", "新闻", "近况", "最新进展", "latest", "today", "news", "recent")
-
-        if any(keyword in normalized for keyword in wechat_keywords):
+        if any(keyword in normalized for keyword in _DIMENSION_KEYWORDS["wechat"]):
             intent = "wechat"
             preferred_providers = ["wechat_crawler", "tavily", "searxng", "exa"]
-            include_domains = ["mp.weixin.qq.com"]
+            include_domains = list(QIANDU_DOMAIN_ALLOWLIST["wechat"])
             queries.extend([f"{normalized} 公众号", f"{normalized} site:mp.weixin.qq.com"])
-        elif any(keyword in normalized for keyword in legal_keywords):
-            intent = "legal_entity"
+        elif any(keyword in normalized for keyword in _DIMENSION_KEYWORDS["judicial"]):
+            intent = "judicial"
             preferred_providers = ["tavily", "exa", "searxng"]
-            include_domains = ["qcc.com", "court.gov.cn"]
-            queries.extend([f"{normalized} 企查查", f"{normalized} 法院 判决书"])
-        elif any(keyword in normalized for keyword in social_keywords) or re.search(r"[@_A-Za-z0-9]{4,}", normalized):
-            intent = "social_id"
+            include_domains = list(QIANDU_DOMAIN_ALLOWLIST["judicial"])
+            queries.extend([f"{normalized} 裁判文书", f"{normalized} 法院 判决书"])
+        elif any(keyword in normalized for keyword in _DIMENSION_KEYWORDS["business"]):
+            intent = "business"
+            preferred_providers = ["tavily", "exa", "searxng"]
+            include_domains = list(QIANDU_DOMAIN_ALLOWLIST["business"])
+            queries.extend([f"{normalized} 企查查", f"{normalized} 法定代表人"])
+        elif any(keyword in normalized for keyword in _DIMENSION_KEYWORDS["education"]):
+            intent = "education"
+            preferred_providers = ["tavily", "exa", "searxng"]
+            include_domains = list(QIANDU_DOMAIN_ALLOWLIST["education"])
+            queries.extend([f"{normalized} 学历", f"{normalized} 毕业院校"])
+        elif any(keyword in normalized for keyword in _DIMENSION_KEYWORDS["profession"]):
+            intent = "profession"
+            preferred_providers = ["tavily", "exa", "searxng"]
+            include_domains = list(QIANDU_DOMAIN_ALLOWLIST["profession"])
+            queries.extend([f"{normalized} 任职", f"{normalized} 职业 履历"])
+        elif any(keyword in normalized for keyword in _DIMENSION_KEYWORDS["social"]) or re.search(r"[@_A-Za-z0-9]{4,}", normalized):
+            intent = "social"
             preferred_providers = ["snoop", "tavily", "searxng", "exa"]
-            include_domains = ["weibo.com"]
-            queries.extend([f"{normalized} 微博", f"{normalized} 账号"])
+            include_domains = list(QIANDU_DOMAIN_ALLOWLIST["social"])
+            queries.extend([f"{normalized} 微博", f"{normalized} 小红书"])
 
+        news_keywords = ("最新", "今天", "最近", "新闻", "近况", "最新进展", "latest", "today", "news", "recent")
         if any(keyword in lowered for keyword in news_keywords) or any(keyword in normalized for keyword in news_keywords):
             topic = "news"
             time_range = "week"
